@@ -1,0 +1,82 @@
+BlackBerry OS is a discontinued proprietary mobile operating system
+developed by Research In Motion (RIM, later BlackBerry Limited) for its
+BlackBerry line of smartphones. It was designed for the smartphone
+context rather than for desktops or servers, and it ran on
+ARM-class handheld hardware with small amounts of RAM and flash storage.
+Its defining priorities were secure, reliable, battery-efficient
+messaging---especially push email---for enterprise and government users,
+delivered through a tightly integrated stack in which RIM controlled the
+hardware, the operating system, the Java application runtime, and the
+servier-side infrastructure end to end \citep{historytools2024}.
+
+\subsection{Author(s)}
+BlackBerry OS was developed by Research In Motion (RIM), the Canadian
+company founded in 1984  in Waterloo, Ontario by Mike Lazaridis and
+Douglas Fregin \citep{historytools2024}. RIM began as a wireless
+data company building modems and pagers, and it was this background in
+reliable wireless data transmission, rather than in general-purpose
+computing, that shaped the operating system that followed
+\citep{historytools2024}.
+
+\subsection{History}
+BlackBerry OS first appeared in 1999 on the Inter@ctive Pager 950 / the
+BlackBerry 850, a two-way paging and wireless-email device with a QWERTY
+keyboard and a trackwheel \citep{historytools2024}. According to
+RIM's own developer documentation for these early handhelds, the
+operating system used a co-operative scheduler in which each task had to
+yield so that other tasks could use the CPU, ran applications as tasks
+and threads, and had tasks communicate by passing messages; the system
+used two distinct types of memory, normally hidden behind file-system
+handles, and deliberately used flash memory rather than a traditional
+file system to suit a portable wireless device \citep{rim950manual}.
+
+In 2002, with the BlackBerry 5810, RIM entered the smartphone market by
+adding voice alongside data \citep{historytools2024}. From version
+3.6 onward the platform was rewritten around Java, and the line evolved
+through OS 4.x, 5.0 (2009), 6.0 (2010), and 7.x (2011), gaining a richer
+UI, a web browser, and an expanded application framework
+\citep{phonemore_bbos, reincubate_bb71}. It was eventually retired
+in favour of the QNX-based BlackBerry 10, which RIM launched in January
+2013 as its second major platform transition since 1999
+\citep{crackberry_qnxhistory, osorg2023}. BlackBerry OS 7.1 was the
+last release of the classic line \citep{phonemore_bbos,
+  reincubate_bb71}.
+
+\subsection{Influence}
+The hardware environment of the late 1990s and 2000s---scant
+RAM, slow NAND flash, narrow wireless bandwidth, and severe battery
+constraints---directly shaped BlackBerry OS. RIM's answer was extreme
+frugality: a thin operating system, a compact Java virtual machine
+acting as the application runtime, and a server-side architecture
+(BlackBerry Enterprise Server, BES) that compressed and pushed email so
+the device itself did little work \citep{historytools2024}. The
+choice of a Java VM as the default application environment meant
+applications ran in a managed, sandboxed runtime rather than as native
+code, trading raw performance for safety and portability across device
+models. BlackBerry OS was itself influenced by the conventions of
+contemporary message-loop desktop systems \citep{rim950manual}, and
+in turn its push-email model and strong enterprise security posture
+influenced how later platforms approached mobile email and mobile device
+management.
+
+\subsection{Motivation}
+The problem BlackBerry OS set out to solve was reliable, secure,
+low-latency mobile messaging---especially push email---for business and
+government users over constrained wireless networks
+\citep{historytools2024}. The intended audience was enterprise and
+security-conscious customers (corporate IT departments, financial firms,
+and governments), not general consumers or hobbyist developers
+\citep{historytools2024}. This shaped a design that valued control
+and predictability over openness.
+
+\subsection{Objective and Purpose}
+RIM prioritised security, battery efficiency, and messaging reliability
+over openness, raw performance, or a large third-party app ecosystem.
+The design philosophy is best described as a tightly integrated,
+vertically controlled appliance: RIM controlled the hardware, the OS,
+the Java runtime, and the server infrastructure end to end, and required
+third-party applications to be digitally signed before they could access
+sensitive APIs \citep{tutorialspoint_bbsec, withsecure2012}. Where
+UNIX-derived systems follow an ``everything is a file'' openness,
+BlackBerry's philosophy was closer to ``everything is controlled and
+signed.''

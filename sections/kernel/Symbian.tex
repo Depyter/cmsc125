@@ -1,0 +1,231 @@
+\subsection{Symbian OS}
+
+\begin{center}
+\begin{minipage}{0.95\textwidth}
+\small\textbf{Source Note:} All source-file references in this discussion
+(\texttt{kernel/eka/}) are drawn from the Symbian Foundation's open-source
+EKA2 kernel repository:\par
+\centering\url{https://github.com/SymbianSource/oss.FCL.sf.os.kernelhwsrv}
+\end{minipage}
+\end{center}
+\medskip
+
+Symbian OS employs the \textbf{EKA2} (EPOC Kernel Architecture 2), a
+two-layer hybrid kernel design that combines a minimal, hardware-near
+\textit{nanokernel} with a more capable \textit{kernel executive} layer
+\citep{sales2005}. The core source code for EKA2 is organised in three
+directories: \texttt{kernel/eka/nkern/} (nanokernel), \texttt{kernel/eka/
+kernel/} (kernel proper), and \texttt{kernel/eka/include/} (headers and
+interface definitions) \citep{symbian_eka2_kernel}. This architecture was
+purpose-built for mobile phones in the late 1990s and 2000s, where devices
+had 4--32~MB of RAM, battery-power constraints, and real-time telephony
+requirements \citep{symbian_eka2_kernel}.
+
+\subsubsection{Architecture: A Layered Nanokernel + Kernel Hybrid}
+
+The EKA2 is neither a pure microkernel nor a traditional monolithic kernel.
+Instead, it separates concerns into two distinct layers with an enforced,
+one-direction dependency: the nanokernel provides the absolute
+minimum---threads, a 64-priority-level preemptive scheduler
+(\texttt{KNumPriorities} is defined as 64 in \texttt{nkern/nkern.h}
+\citep{symbian_eka2_kernel}), fast mutexes and spin locks with ordered
+deadlock prevention (\texttt{TSpinLock} with the \texttt{TOrder} enum in
+\texttt{nkern/nkern.h}), nanokernel timers (\texttt{NTimer}), and
+interrupt-service-routine (ISR) dispatch \citep{sales2005}---while the
+kernel layer builds on top to provide processes, inter-process communication
+(IPC), memory objects (chunks), device driver frameworks, and platform
+security. The nanokernel is designed to be buildable as a standalone unit
+(via the \texttt{\_\_STANDALONE\_NANOKERNEL\_\_} macro in \texttt{nkern.h})
+de-coupled from the full OS \citep{symbian_eka2_kernel}, and a strict layering
+rule enforced by header-inclusion discipline prevents it from ever calling
+upward into the kernel layer.
+
+The kernel's bootstrap sequence begins in
+\texttt{KernelMain()} (\texttt{kernel/arm/cinit.cpp}), which calls
+\texttt{P::CreateVariant()} to load the ASIC/hardware variant, then
+calls \texttt{K::InitialiseMicrokernel()} in \texttt{kernel/sinit.cpp}
+\citep{symbian_eka2_kernel}. This function creates the null thread, the
+initial process, the kernel heap, and per-CPU data structures before
+spawning the Supervisor thread, which calls \texttt{K::Init3} to
+create the DFC queues (\texttt{DfcQ0}, \texttt{DfcQ1},
+\texttt{TimerDfcQ} in \texttt{kernel/sglobals.cpp})
+and starts the system tick \citep{symbian_eka2_kernel}.
+
+At compile time, the kernel is paired with one of four swappable memory
+models---\textit{direct} (single, fixed address space for low-end devices),
+\textit{flexible} (full virtual memory with per-process address spaces),
+\textit{moving} (MMU-based with memory defragmentation), and
+\textit{multiple} (the model used on most ARM smartphones), exposed through
+the \texttt{M::} namespace interface---allowing the same kernel codebase to
+target hardware ranging from simple feature phones to smartphone-class ARM
+processors \citep{sales2005, symbian_eka2_kernel}.
+
+\subsubsection{Kernel-Space vs.\ User-Space Separation}
+
+Symbian enforces the user-kernel boundary with the ARM MMU. The
+\textit{Super Page} structure (\texttt{SSuperPageBase}, defined in
+\texttt{kernel/kernboot.h}) is a pinned, shared-memory block mapped into
+every process's address space, holding system-global data such as ROM and
+RAM sizes, the page directory physical address, and ASIC/variant pointers
+\citep{symbian_eka2_kernel}. Each user process receives its own address space
+created by the memory-model layer, and the kernel runs in ARM Supervisor
+(SVC) mode while user code executes in User (USR) mode \citep{sales2005}.
+
+All user-to-kernel transitions go through the ARM SWI (Software Interrupt)
+instruction, dispatched via a fast-exec/slow-exec call table mechanism
+defined in \texttt{include/u32exec.h}, which provides \texttt{FAST\_EXEC0}
+and \texttt{SLOW\_EXEC0} macros that generate the SWI instructions with the
+appropriate exec-table index \citep{symbian_eka2_kernel}. Each thread carries
+its own pair of exec-table pointers, enabling different ``personality''
+layers to expose alternative system call interfaces atop the same kernel.
+The executive call dispatch on ARM is machine-coded (indicated by
+\texttt{\_\_FASTEXEC\_MACHINE\_CODED\_\_} in \texttt{kernel/kern\_priv.h}),
+replacing C++ with hand-optimised assembly in production builds
+\citep{symbian_eka2_kernel}.
+
+When a user process attempts an illegal kernel memory access, the ARM Data
+Abort handler dispatches through the per-thread \texttt{EpocThreadHandlers}
+structure in \texttt{kernel/sthread.cpp}, which binds \texttt{Exc::Dispatch}
+as the exception handler for each thread \citep{symbian_eka2_kernel}. The
+kernel provides \texttt{TExcTrap}---a try/catch mechanism defined with the
+\texttt{XTRAP} macro in \texttt{kernel/kern\_priv.h}---for kernel code that
+must safely handle exceptions, and \texttt{TPagingExcTrap} (via
+\texttt{XTRAP\_PAGING}) for transparently resolving demand-paging faults
+\citep{symbian_eka2_kernel}. If no trap is active, the offending thread is
+terminated and its process is killed, but the kernel survives---a guarantee
+any MMU-based OS provides \citep{sales2005}.
+
+For security, EKA2 (introduced in Symbian OS v9) added a capability-based
+Platform Security model. The \texttt{TCapability} enumeration in
+\texttt{include/e32capability.h} defines four key capability levels:
+\texttt{ECapabilityTCB} for trusted computing base access,
+\texttt{ECapabilityCommDD} for communication device drivers,
+\texttt{ECapabilityPowerMgmt} for power management, and
+\texttt{ECapabilityMultimediaDD} for multimedia drivers
+\citep{symbian_eka2_kernel}. The kernel's capability-checking implementation
+resides in \texttt{kernel/ssecure.cpp}, which validates process capabilities
+against required sets on every sensitive operation \citep{symbian_eka2_kernel}.
+This model is simpler than Linux's layered user/group DAC + POSIX
+capabilities + SELinux stack, but was well-suited to a closed mobile
+platform where all software was code-signed and vetted by the device
+manufacturer.
+
+\subsubsection{Interrupt Handling: The DFC/IDFC Model}
+
+A standout design feature of EKA2 is its \textbf{staged interrupt
+processing} chain, adapted from Digital Equipment Corporation's VMS
+operating system \citep{sales2005}. The implementation lives in
+\texttt{nkern/dfcs.cpp}, where the \texttt{TDfc} constructor supports three
+calling contexts: pure DFC (priority 0--7, where 7 is highest), IDFC
+(identified by \texttt{iPriority=0xff}, meaning it can only be queued via
+\texttt{TDfc::Add()} from an ISR), and DFC with a pre-bound queue
+\citep{symbian_eka2_kernel}. Interrupts flow through three stages:
+
+\begin{enumerate}
+  \item \textbf{ISR} (Interrupt Service Routine) --- runs with interrupts
+        disabled, performs minimal hardware acknowledgement, and queues
+        either an IDFC or DFC via \texttt{TDfc::Add()}.
+  \item \textbf{IDFC} (Immediate Deferred Function Call) --- runs in the
+        interrupt post-amble with interrupts enabled but the kernel locked;
+        must be extremely short and non-blocking.
+  \item \textbf{DFC} (Deferred Function Call) --- runs in a dedicated DFC
+        thread context with the kernel unlocked and full kernel services
+        available; handles the bulk of interrupt work and is preemptible
+        by higher-priority threads \citep{symbian_eka2_kernel}.
+\end{enumerate}
+
+The DFC system provides eight priority levels per queue
+(\texttt{KNumDfcPriorities} is 8 in \texttt{include/nkern/dfcs.h}), with
+per-thread DFC queues for device drivers and three shared system DFC queues
+(\texttt{K::DfcQ0}, \texttt{K::DfcQ1}, and \texttt{K::TimerDfcQ}, declared
+in \texttt{kernel/sglobals.cpp}) for general kernel use
+\citep{symbian_eka2_kernel}. These queues are initialised in \texttt{K::Init3()}
+(in \texttt{kernel/sinit.cpp}) with priority levels 27 and 48 respectively,
+and their threads are marked as system-permanent so they cannot exit
+\citep{symbian_eka2_kernel}. This design yields very short interrupt-off
+windows---typically just the ISR prologue in assembly (a few dozen ARM
+instructions)---making EKA2 well-suited for the bounded-latency requirements
+of GSM/CDMA protocol stacks \citep{sales2005}.
+
+\subsubsection{Modularity and Extensibility}
+
+The kernel is modular within its layers but linked as a monolithic
+executable image (\texttt{ekern.exe}). Its key extension mechanisms include:
+
+\begin{itemize}
+  \item \textbf{LDD/PDD driver model} --- Physical Device Drivers (PDDs)
+        handle hardware specifics, while Logical Device Drivers (LDDs)
+        provide the OS integration API. The \texttt{Kern::InstallLogicalDevice()}
+        function in \texttt{kernel/device.cpp} registers a logical device
+        with the kernel's object container, and \texttt{DoLogicalDeviceLoad()}
+        resolves a \texttt{TLogicalDeviceNew} factory from a code-segment DLL
+        at runtime to instantiate the driver \citep{symbian_eka2_kernel}.
+  \item \textbf{Personality layers} --- alternative RTOS APIs can be layered
+        atop Symbian nanokernel primitives, wrapping \texttt{NThread},
+        \texttt{NFastSemaphore}, and \texttt{NTimer} objects behind a custom
+        task interface (see \texttt{personality/example/personality.cpp})
+        \citep{symbian_eka2_kernel}.
+  \item \textbf{Variant/ASIC DLLs} --- hardware-platform support is
+        encapsulated in variant DLLs loaded at boot by
+        \texttt{A::CreateVariant()} in \texttt{kernel/arm/cinit.cpp}, which
+        calls the DLL's exported ordinal-1 initialisation function and
+        populates \texttt{K::VariantData[31]} with per-variant pointers,
+        enabling a single kernel binary to support multiple hardware designs
+        \citep{symbian_eka2_kernel}.
+\end{itemize}
+
+However, compared to Linux's loadable kernel module system, Symbian's
+extension system is more constrained: drivers and extensions are typically
+loaded at boot and unloading is not a primary design consideration,
+reflecting the mobile-phone model where runtime reconfiguration is rare
+\citep{sales2005}.
+
+\subsubsection{Performance, Security, and Fault Isolation}
+
+The nanokernel minimalism gives EKA2 strong real-time characteristics:
+critical paths such as context switches and interrupt entry/exit are
+implemented in hand-optimised ARM assembly, indicated by preprocessor macros
+\texttt{\_\_FASTEXEC\_MACHINE\_CODED\_\_}, \texttt{\_\_MMU\_MACHINE\_CODED\_\_},
+and \texttt{\_\_SCHEDULER\_MACHINE\_CODED\_\_} in \texttt{kernel/kern\_priv.h}
+\citep{symbian_eka2_kernel}. The \texttt{TScheduler} in \texttt{nkern/sched.cpp}
+implements preemptive round-robin within each priority level with a
+configurable timeslice; when a thread blocks, it receives a fresh timeslice
+(\texttt{iTime = iTimeslice}) \citep{symbian_eka2_kernel}. IPC in Symbian uses
+shared chunks with zero-copy message passing: the
+\texttt{RMessageK}/\texttt{RMessageU2} classes in \texttt{kernel/sipc.cpp}
+define the kernel- and user-side message formats, and
+\texttt{K::USafeWrite()} safely copies data to user space during IPC
+completion, catching faults via the \texttt{TIpcExcTrap} mechanism rather
+than crashing \citep{symbian_eka2_kernel}.
+
+The kernel's object model is built on the \texttt{DObject} base class
+(\texttt{kernel/object.cpp}), whose constructor atomically assigns a
+unique 64-bit object ID using an atomic addition and initialises
+the reference count to 1 \citep{symbian_eka2_kernel}. All kernel objects
+(threads, processes, chunks, mutexes, semaphores, servers, code segments,
+logical devices, logical channels) are tracked in a uniform
+\texttt{DObjectCon} container array indexed by \texttt{EObjectType} in
+\texttt{K::Containers[ENumObjectTypes]}, allowing type-safe traversal and
+cleanup \citep{symbian_eka2_kernel}.
+
+The key trade-off is that \textbf{drivers and file systems run in kernel
+space}. This eliminates IPC overhead per I/O operation---critical on
+100--400~MHz ARM processors---but means a null-pointer dereference in a USB
+or display driver triggers a \texttt{Kern::Fault} panic that halts the
+entire system. The thread state machine in \texttt{kernel/sthread.cpp}
+exemplifies this: when a thread enters an invalid state, the
+\texttt{DefaultUnknownStateHandler} calls \texttt{Kern::Fault("THREAD STATE",
+aThread->iMState)}, which brings down the whole kernel
+\citep{symbian_eka2_kernel}. There is no mechanism to restart an individual
+kernel component. User-process failures, by contrast, are fully isolated;
+the \texttt{DProcess} destructor in \texttt{kernel/sprocess.cpp} releases all
+command-line buffers, environment data, handles, chunks, threads, and
+semaphores held by the terminated process \citep{symbian_eka2_kernel}.
+
+For its era and target hardware, this design was an appropriate trade-off.
+All kernel-space code was provided by the device manufacturer and underwent
+extensive testing and code signing, managing risk at the development stage
+rather than at runtime. The nanokernel's clean architectural boundary---a
+minimal, auditable, machine-coded core with no upward dependencies---remains
+an instructive pattern in embedded kernel design \citep{sales2005,
+  symbian_eka2_kernel}.
