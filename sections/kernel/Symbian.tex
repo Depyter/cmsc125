@@ -5,7 +5,7 @@ local Symbian EPOC Kernel Architecture 2 (EKA2) source tree in this workspace
 under \texttt{kernel/eka/}.
 The upstream repository is
 \url{https://github.com/SymbianSource/oss.FCL.sf.os.kernelhwsrv}. Each caption
-names the relevant source file or files.}
+uses the shortest unambiguous path under \texttt{kernel/eka/}.}
 
 Symbian EKA2 is best understood as a layered nanokernel-plus-kernel design.
 The nanokernel exports the minimal execution substrate, while the larger kernel
@@ -43,8 +43,8 @@ IMPORT_C void NKFault(const char* file, TInt line);
 void NKIdle(TUint32 aStage);
 }
 \end{minted}
-\caption{Standalone nanokernel boundary and low-level surface. Source:
-\texttt{include/nkern/nkern.h}.}
+\caption{Standalone nanokernel boundary and low-level surface. File:
+\texttt{nkern.h}.}
 \label{lst:kernel-nkern-boundary}
 \end{listing}
 
@@ -56,25 +56,12 @@ routine. Listing~\ref{lst:kernel-init-split} captures that handoff.
 
 \begin{listing}[H]
 \begin{minted}{cpp}
-	info.iSlowExecTable = (const SSlowExecTable*)EpocSlowExecTable;
-	info.iParameterBlock = (const TUint32*)aInfo;
-	info.iParameterBlockSize = 0;
-	info.iCpuAffinity = 0;
-	info.iGroup = 0;
-
-	TAny* ec = t->iNThread.iExtraContext;
-	TInt ecs = t->iNThread.iExtraContextSize;
 	NKern::Init(&t->iNThread, info);
-	t->iNThread.SetExtraContext(ec, ecs);
-
-	__KTRACE_OPT(KBOOT,DEBUGPRINT("NKern::CurrentThread() = %08x",
-		NKern::CurrentThread()));
-
 	M::Init2AP();
 	A::Init2AP();
 \end{minted}
 \caption{Boot-time handoff from nanokernel setup into the memory model and
-variant layer. Source: \texttt{kernel/sinit.cpp}.}
+variant layer. File: \texttt{sinit.cpp}.}
 \label{lst:kernel-init-split}
 \end{listing}
 
@@ -96,16 +83,7 @@ events.
 \begin{minted}{cpp}
 extern "C" void NKIdle(TUint32 aStage)
 	{
-	SCpuIdleHandler* cih = NKern::CpuIdleHandler();
-#ifdef __SMP__
-	TSubScheduler& ss = SubScheduler();
-	if (cih && cih->iHandler)
-		(*cih->iHandler)(cih->iPtr, aStage, ss.iUncached);
-#else
-	if (cih && cih->iHandler)
-		(*cih->iHandler)(cih->iPtr, aStage);
-#endif
-	else if (K::PowerModel)
+	if (K::PowerModel)
 		K::PowerModel->CpuIdle();
 	else
 		Arm::TheAsic->Idle();
@@ -115,15 +93,10 @@ class DPowerManager : public DPowerModel
 	{
 public:
 	void CpuIdle();
-	void RegisterUserActivity(const TRawEvent& anEvent);
-	TInt PowerHalFunction(TInt aFunction, TAny* a1, TAny* a2);
-	void AbsoluteTimerExpired();
-	void SystemTimeChanged(TInt anOldTime, TInt aNewTime);
-	TSupplyStatus MachinePowerStatus();
 	};
 \end{minted}
-\caption{Idle handling and power-model integration. Source:
-\texttt{kernel/arm/cinit.cpp} and \texttt{kernel/power.cpp}.}
+\caption{Idle handling and power-model integration. Files:
+\texttt{arm/cinit.cpp} and \texttt{power.cpp}.}
 \label{lst:kernel-power}
 \end{listing}
 
@@ -142,30 +115,23 @@ subsystems.
 EXPORT_C TInt Kern::InstallLogicalDevice(DLogicalDevice* aDevice)
 	{
 	aDevice->SetProtection(DObject::EGlobal);
-	aDevice->iObjectFlags |= DObject::EObjectExtraReference;
 	TInt r=aDevice->Install();
 	if (r==KErrNone)
 		r=K::AddObject(aDevice,ELogicalDevice);
 	return r;
 	}
 
-TMachineConfig* K::MachineConfig;
-DThread* K::TheKernelThread;
-DProcess* K::TheKernelProcess;
 TDfcQue* K::DfcQ0;
-TDfcQue* K::DfcQ1;
-TDfcQue* K::TimerDfcQ;
 DObjectCon* K::Containers[ENumObjectTypes];
 
 EXPORT_C DObject::DObject()
 	{
-	iAccessCount=1;
 	iObjectId = __e32_atomic_add_ord64(&NextObjectId, TUint64(1<<18));
 	}
 \end{minted}
 \caption{Kernel driver installation, shared global state, and base object
-construction. Source: \texttt{kernel/device.cpp}, \texttt{kernel/sglobals.cpp},
-and \texttt{kernel/object.cpp}.}
+construction. Files: \texttt{device.cpp}, \texttt{sglobals.cpp}, and
+\texttt{object.cpp}.}
 \label{lst:kernel-drivers-objects}
 \end{listing}
 
@@ -184,44 +150,23 @@ system-call path explicit and inspectable instead of implicit or opaque.
 \begin{minted}{cpp}
 struct SSuperPageBase
 	{
-	TInt		iRamDriveSize;
-	TInt		iTotalRomSize;
 	TInt		iTotalRamSize;
 	TLinAddr	iPageDir;
-	TInt		iKernelFault;
-	TLinAddr	iRamBootData;
-	TLinAddr	iRomBootData;
-	TLinAddr	iBootTable;
 	TLinAddr	iCodeBase;
 	TUint32		iBootFlags;
-	TLinAddr	iBootAlloc;
-	TLinAddr	iMachineData;
-	TUint		iActiveVariant;
 	TLinAddr	iPrimaryEntry;
-	TInt		iInitialHeapSize;
-	TInt		iDebugPort;
 	TUint		iCpuId;
-	TLinAddr	iUncachedAddress;
-	TLinAddr	iRootDirList;
-	TInt		iHwStartupReason;
 	};
 
-#define	FAST_EXEC_BEGIN	\
-	GLDEF_D const TUint32 EpocFastExecTable[] =		\
-		{
-
-#define	SLOW_EXEC_BEGIN	\
-	GLDEF_D const TUint32 EpocSlowExecTable[] =		\
-		{
-
+/* fast and slow executive calls use explicit dispatch tables */
 	const SNThreadHandlers* iHandlers;
 	const SFastExecTable* iFastExecTable;
 	const SSlowExecEntry* iSlowExecTable;
 	TLinAddr iSavedSP;
 \end{minted}
 \caption{Shared super-page state and explicit executive-call dispatch
-machinery. Source: \texttt{include/kernel/kernboot.h},
-\texttt{include/kernel/execs.h}, and \texttt{include/nkern/nk\_priv.h}.}
+machinery. Files: \texttt{kernboot.h}, \texttt{execs.h}, and
+\texttt{nk\_priv.h}.}
 \label{lst:kernel-userspace-boundary}
 \end{listing}
 
@@ -233,19 +178,6 @@ in kernel mode, but it does not assume user memory can be touched recklessly.
 
 \begin{listing}[H]
 \begin{minted}{cpp}
-class TExcTrap
-	{
-public:
-	IMPORT_C TInt Trap();
-	IMPORT_C TInt Trap(TExcTrapHandler aHandler);
-	inline void UnTrap();
-	IMPORT_C void Exception(TInt aResult);
-public:
-	TUint32 iState[EXC_TRAP_CTX_SZ];
-	TExcTrapHandler iHandler;
-	DThread* iThread;
-	};
-
 class TPagingExcTrap
 	{
 public:
@@ -258,13 +190,13 @@ public:
 	};
 
 #define XTRAP_PAGING(_r,_s)	{								\
-							TPagingExcTrap __t;				\
-							if (((_r)=__t.Trap())==0)		\
-								{							\
-								_s;							\
-								__t.UnTrap();				\
-								}							\
-							}
+	TPagingExcTrap __t;											\
+	if (((_r)=__t.Trap())==0)									\
+		{														\
+		_s;														\
+		__t.UnTrap();											\
+		}														\
+	}
 
 void TServerMessage::CallbackFunc(TAny* aData, TUserModeCallbackReason aReason)
 	{
@@ -277,8 +209,8 @@ void TServerMessage::CallbackFunc(TAny* aData, TUserModeCallbackReason aReason)
 	TClientRequest::CallbackFunc(aData, aReason);
 	}
 \end{minted}
-\caption{Exception trapping and safe user-memory crossing. Source:
-\texttt{include/kernel/kern\_priv.h} and \texttt{kernel/sipc.cpp}.}
+\caption{Exception trapping and safe user-memory crossing. Files:
+\texttt{kern\_priv.h} and \texttt{sipc.cpp}.}
 \label{lst:kernel-safe-user}
 \end{listing}
 
@@ -297,25 +229,14 @@ extern "C" {
 SArmInterruptInfo ArmInterruptInfo;
 }
 
-TScheduler TheScheduler;
-
-const TInt KNumDfcPriorities=8;
-const TInt KMaxDfcPriority=KNumDfcPriorities-1;
-
 class TDfcQue : public TPriList<TDfc,KNumDfcPriorities>
 	{
 public:
-	IMPORT_C TDfcQue();
-	inline TBool IsEmpty();
 	static void ThreadFunction(TAny* aDfcQ);
-public:
-	NThreadBase* iThread;
 	};
 
 EXPORT_C TInt NTimer::OneShot(TInt aTime, TBool aDfc)
 	{
-	__NK_ASSERT_DEBUG(aTime>=0);
-	__NK_ASSERT_DEBUG(iFunction!=NULL);
 	TInt irq=NKern::DisableAllInterrupts();
 	if (iState!=EIdle)
 		{
@@ -330,8 +251,8 @@ EXPORT_C TInt NTimer::OneShot(TInt aTime, TBool aDfc)
 	}
 \end{minted}
 \caption{Interrupt state, deferred-call queues, and timer completion policy.
-Source: \texttt{nkern/arm/ncglob.cpp}, \texttt{include/nkern/dfcs.h}, and
-\texttt{nkern/nk\_timer.cpp}.}
+Files: \texttt{arm/ncglob.cpp}, \texttt{dfcs.h}, and
+\texttt{nk\_timer.cpp}.}
 \label{lst:kernel-interrupts}
 \end{listing}
 
@@ -351,8 +272,7 @@ enum TCapability
 	{
 	ECapabilityTCB				= 0,
 	ECapabilityCommDD			= 1,
-	ECapabilityPowerMgmt		= 2,
-	ECapabilityMultimediaDD		= 3,
+	ECapabilityPowerMgmt		= 2
 	};
 
 EXPORT_C TBool DProcess::DoHasCapability(TCapability aCapability,
@@ -362,17 +282,9 @@ EXPORT_C TBool DProcess::DoHasCapability(TCapability aCapability,
 		return ETrue;
 	return PlatSec::CapabilityCheckFail(this,aCapability,aContextText)==KErrNone;
 	}
-
-EXPORT_C TBool DThread::DoHasCapability(TCapability aCapability,
-	const char* aContextText)
-	{
-	if(iOwningProcess->HasCapabilityNoDiagnostic(aCapability))
-		return ETrue;
-	return PlatSec::CapabilityCheckFail(this,aCapability,aContextText)==KErrNone;
-	}
 \end{minted}
-\caption{Capability definitions and kernel-side capability enforcement. Source:
-\texttt{include/e32capability.h} and \texttt{kernel/ssecure.cpp}.}
+\caption{Capability definitions and kernel-side capability enforcement. Files:
+\texttt{e32capability.h} and \texttt{ssecure.cpp}.}
 \label{lst:kernel-capabilities}
 \end{listing}
 
@@ -391,13 +303,11 @@ state as a kernel-fatal condition.
 IMPORT_C void NKFault(const char* file, TInt line);
 #define FAULT()		NKFault(__FILE__,__LINE__)
 
-	__KTRACE_OPT(KTHREAD,Kern::Printf(
-		"UNKNOWN THREAD MSTATE!! thread %O Mstate=%d, operation=%d, parameter=%d",
-		aThread,aThread->iMState,anOperation,aParameter));
+	/* unexpected thread-state transition */
 	Kern::Fault("THREAD STATE",aThread->iMState);
 \end{minted}
 \caption{Kernel-fatal fault paths for nanokernel and thread-state corruption.
-Source: \texttt{include/nkern/nkern.h} and \texttt{kernel/sthread.cpp}.}
+Files: \texttt{nkern.h} and \texttt{sthread.cpp}.}
 \label{lst:kernel-faults}
 \end{listing}
 

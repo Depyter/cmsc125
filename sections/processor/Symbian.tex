@@ -5,7 +5,7 @@ the local Symbian EPOC Kernel Architecture 2 (EKA2) source tree in this
 workspace under \texttt{kernel/eka/}.
 The upstream repository is
 \url{https://github.com/SymbianSource/oss.FCL.sf.os.kernelhwsrv}. Each caption
-names the relevant source file or files.}
+uses the shortest unambiguous path under \texttt{kernel/eka/}.}
 
 Symbian EKA2 uses a \textbf{fixed-priority preemptive scheduler} with
 round-robin inside each priority level. The revised presentation follows the
@@ -27,18 +27,9 @@ latency than about global fairness \citep{sales2005, symbian_eka2_kernel}.
 class TPriListBase
 	{
 public:
-	IMPORT_C TPriListBase(TInt aNumPriorities);
 	IMPORT_C TInt HighestPriority();
-	IMPORT_C TPriListLink* First();
-	IMPORT_C void Add(TPriListLink* aLink);
-	IMPORT_C void AddHead(TPriListLink* aLink);
-	IMPORT_C void Remove(TPriListLink* aLink);
-	IMPORT_C void ChangePriority(TPriListLink* aLink, TInt aNewPriority);
-
 	inline TBool NonEmpty() const
 		{ return iPresent[0]|iPresent[1]; }
-	inline TBool IsEmpty() const
-		{ return !NonEmpty();  }
 	inline TBool operator>(TInt p) const
 		{ return ((p<32) ? (iPresent[1] | (iPresent[0]>>p)>>1)
 		                 : (iPresent[1]>>(p-32))>>1 ); }
@@ -51,8 +42,7 @@ public:
 	SDblQueLink* iQueue[1];
 	};
 \end{minted}
-\caption{Priority bitmap and ready-queue anchors in
-\texttt{include/nkern/nklib.h}.}
+\caption{Priority bitmap and ready-queue anchors in \texttt{nklib.h}.}
 \label{lst:sym-tprilistbase}
 \end{listing}
 
@@ -68,39 +58,20 @@ fairness accounting.
 class TScheduler : public TPriListBase
 	{
 public:
-	TScheduler();
-	void Remove(NThreadBase* aThread);
 	void RotateReadyList(TInt aPriority);
-	void QueueDfcs();
 	static void Reschedule();
 	static void YieldTo(NThreadBase* aThread);
 	void TimesliceTick();
-	IMPORT_C static TScheduler* Ptr();
-	inline void SetProcessHandler(TLinAddr aHandler)
-		{iProcessHandler=aHandler;}
-private:
-	SDblQueLink* iExtraQueues[KNumPriorities-1];
 public:
 	TUint8 iRescheduleNeededFlag;
 	TUint8 iDfcPendingFlag;
-	TInt iKernCSLocked;
 	SDblQue iDfcs;
-	TLinAddr iMonitorExceptionHandler;
-	TLinAddr iProcessHandler;
-	TLinAddr iRescheduleHook;
-	TUint8 iInIDFC;
 	NFastMutex iLock;
 	NThreadBase* iCurrentThread;
-	TAny* iAddressSpace;
-	SDblQue iIdleDfcs;
-	SDblQue iDelayedQ;
-	TDfc iDelayDfc;
-	TUint iMadeReadyCounter;
-	TUint iMadeUnReadyCounter;
 	TUint iTimeSliceExpireCounter;
 	};
 \end{minted}
-\caption{Core scheduler state in \texttt{include/nkern/nk\_priv.h}.}
+\caption{Core scheduler state in \texttt{nk\_priv.h}.}
 \label{lst:sym-tscheduler}
 \end{listing}
 
@@ -131,15 +102,10 @@ enum TProcPriority
 LOCAL_D const TUint8 ThreadPriorityTable[64] =
 	{
 /*Low*/               1,     1,     2,     3,  4,  5, 22,  0,
-/*Background*/        3,     5,     6,     7,  8,  9, 22,  0,
 /*Foreground*/        3,    10,    11,    12, 13, 14, 22,  0,
-/*High*/              3,    17,    18,    19, 20, 22, 23,  0,
 /*SystemServer1*/     9,    15,    16,    21,
                        KPrioritySystemServerMore, 25, 28, 0,
-/*SystemServer2*/     9,    15,    16,    21,
-                       KPrioritySystemServerMore, 25, 28, 0,
-/*SystemServer3*/     9,    15,    16,    21,
-                       KPrioritySystemServerMore, 25, 28, 0,
+/* ... background and other system-server bands omitted ... */
 /*RealTimeServer*/   18,    26,    27,    28, 29, 30, 31, 0
 	};
 
@@ -158,16 +124,14 @@ TInt DThread::CalcDefaultThreadPriority()
 		TInt i=(pp<<3)+tp;
 		r=ThreadPriorityTable[i];
 		if ((r > KMaxPriorityWithoutProtServ) &&
-			!(this->HasCapability(ECapabilityProtServ,
-			  __PLATSEC_DIAGNOSTIC_STRING(
-			    "Warning: thread priority capped to below realtime range"))))
+			!(this->HasCapability(ECapabilityProtServ, /* diagnostic omitted */)))
 			r = KMaxPriorityWithoutProtServ;
 		}
 	return r;
 	}
 \end{minted}
-\caption{Process-priority bands and thread-priority mapping. Source:
-\texttt{include/kernel/kern\_priv.h} and \texttt{kernel/sthread.cpp}.}
+\caption{Process-priority bands and thread-priority mapping. Files:
+\texttt{kern\_priv.h} and \texttt{sthread.cpp}.}
 \label{lst:sym-priority-table}
 \end{listing}
 
@@ -193,14 +157,6 @@ void TScheduler::TimesliceTick()
 		RescheduleNeeded();
 	}
 
-void TScheduler::Remove(NThreadBase* aThread)
-	{
-	__NK_ASSERT_DEBUG(!aThread->iHeldFastMutex);
-	iMadeUnReadyCounter++;
-	aThread->iTime=aThread->iTimeslice;
-	TPriListBase::Remove(aThread);
-	}
-
 void TScheduler::RotateReadyList(TInt p)
 	{
 	__NK_ASSERT_DEBUG(p>=0 && p<KNumPriorities);
@@ -219,9 +175,8 @@ void TScheduler::RotateReadyList(TInt p)
 		}
 	}
 \end{minted}
-\caption{Timeslice state and round-robin rotation. Source:
-\texttt{include/nkern/nk\_priv.h}, \texttt{include/kernel/kern\_priv.h}, and
-\texttt{nkern/sched.cpp}.}
+\caption{Timeslice state and round-robin rotation. Files:
+\texttt{nk\_priv.h}, \texttt{kern\_priv.h}, and \texttt{nkern/sched.cpp}.}
 \label{lst:sym-timeslice}
 \end{listing}
 
@@ -242,16 +197,9 @@ TInt DProcess::SetPriority(TProcessPriority aPriority)
 	TInt p=ConvertPriority(aPriority);
 	if (p<0)
 		return KErrArgument;
-	if (iExitType!=EExitPending)
-		return KErrDied;
-	__KTRACE_OPT(KPROC,Kern::Printf("Process %O SetPriority(%d)",this,p));
 	TInt r=WaitProcessLock();
-	__KTRACE_FAIL(r,Kern::Printf("PSP: %d",r));
 	if (r!=KErrNone)
 		return KErrDied;
-#ifdef BTRACE_THREAD_PRIORITY
-	BTrace8(BTrace::EThreadPriority,BTrace::EProcessPriority,this,p);
-#endif
 	NKern::LockSystem();
 	iPriority=p;
 	SDblQueLink* pLink=iThreadQ.First();
@@ -267,7 +215,7 @@ TInt DProcess::SetPriority(TProcessPriority aPriority)
 	return KErrNone;
 	}
 \end{minted}
-\caption{Process-priority propagation in \texttt{kernel/sprocess.cpp}.}
+\caption{Process-priority propagation in \texttt{sprocess.cpp}.}
 \label{lst:sym-process-setpriority}
 \end{listing}
 
@@ -297,22 +245,16 @@ TInt DThread::DoCreate(SThreadCreateInfo& aInfo)
 		return r;
 	SNThreadCreateInfo ni;
 	ni.iFunction=EpocThreadFunction;
-	ni.iPriority=1;
 	ni.iTimeslice = (iThreadType==EThreadMinimalSupervisor
 	              || iThreadType==EThreadAPInitial
 	              || iThreadType==EThreadInitial)
 	               ? -1
 	               : NKern::TimesliceTicks(EDefaultUserTimeSliceMs*1000);
-	ni.iHandlers = &EpocThreadHandlers;
-	ni.iFastExecTable=(const SFastExecTable*)EpocFastExecTable;
-	ni.iSlowExecTable=(const SSlowExecTable*)EpocSlowExecTable;
-	ni.iParameterBlock=(const TUint32*)&aInfo;
-	ni.iParameterBlockSize=aInfo.iTotalSize;
 	ni.iStackBase=iSupervisorStack;
 	ni.iStackSize=iSupervisorStackSize;
 	}
 \end{minted}
-\caption{Executive-side thread setup. Source: \texttt{kernel/sthread.cpp}.}
+\caption{Executive-side thread setup. File: \texttt{sthread.cpp}.}
 \label{lst:sym-thread-create-exec}
 \end{listing}
 
@@ -325,31 +267,18 @@ TInt NThread::Create(SNThreadCreateInfo& aInfo, TBool aInitial)
 		return r;
 	if (!aInitial)
 		{
-		TUint32* sp=
-			(TUint32*)(iStackBase+iStackSize-aInfo.iParameterBlockSize);
+		TUint32* sp=(TUint32*)(iStackBase+iStackSize-aInfo.iParameterBlockSize);
 		TUint32 r6=(TUint32)aInfo.iParameterBlock;
-		if (aInfo.iParameterBlockSize)
-			{
-			wordmove(sp,aInfo.iParameterBlock,aInfo.iParameterBlockSize);
-			r6=(TUint32)sp;
-			}
+		/* copy parameter block to the new stack, then build the entry frame */
 		*--sp=(TUint32)__StartThread;
-		*--sp=0;
-		*--sp=0;
-		*--sp=0;
-		*--sp=0;
-		*--sp=0;
 		*--sp=r6;
 		*--sp=(TUint32)aInfo.iFunction;
 		*--sp=(TUint32)this;
-		*--sp=0x13;
-		*--sp=0;
-		*--sp=0;
 		}
 	}
 \end{minted}
-\caption{Nanokernel thread bootstrap frame construction. Source:
-\texttt{nkern/arm/ncthrd.cpp}.}
+\caption{Nanokernel thread bootstrap frame construction. File:
+\texttt{arm/ncthrd.cpp}.}
 \label{lst:sym-thread-create-nkern}
 \end{listing}
 
@@ -368,37 +297,14 @@ the right next thread with as little overhead as possible.
 \begin{minted}{cpp}
 __NAKED__ void TScheduler::Reschedule()
 	{
-	asm("ldr r0, __TheScheduler ");
-	asm("str lr, [sp, #-4]! ");
 	SET_INTS(r3, MODE_SVC, INTS_ALL_OFF);
-	asm("ldrb r1, [r0, #%a0]" : : "i"
-		_FOFF(TScheduler,iDfcPendingFlag));
-	asm("mov r2, #0 ");
-	asm("cmp r1, #0 ");
-	asm("start_resched: ");
-	asm("blne  " CSM_ZN10TScheduler9QueueDfcsEv);
-	asm("ldrb r1, [r0, #%a0]" : : "i"
-		_FOFF(TScheduler,iRescheduleNeededFlag));
-	SET_INTS_1(r3, MODE_SVC, INTS_ALL_ON);
-	asm("cmp r1, #0 ");
-	asm("beq no_resched_needed ");
-	SET_INTS_2(r3, MODE_SVC, INTS_ALL_ON);
-	asm("mrs r2, spsr ");
-	asm("ldr r1, [r0, #%a0]" : : "i"
-		_FOFF(TScheduler,iCurrentThread));
-	asm("stmfd sp!, {r2,r4-r11} ");
-	asm("str sp, [r1, #%a0]" : : "i"
-		_FOFF(NThread,iSavedSP));
-#ifdef __CPU_ARM_HAS_CLZ
-	CLZ(12,14);
-	asm("subs r12, r12, #32 ");
-	CLZcc(CC_EQ,12,1);
-	asm("rsb r12, r12, #31 ");
-#endif
-	asm("ldr r2, [r0, r12, lsl #2] ");
+	/* queue pending DFCs */
+	/* save the current thread context */
+	/* choose the highest-priority ready thread */
+	/* restore the next thread and return */
 	}
 \end{minted}
-\caption{Hot reschedule path in \texttt{nkern/arm/ncsched.cia}.}
+\caption{Hot reschedule path in \texttt{arm/ncsched.cia}.}
 \label{lst:sym-reschedule}
 \end{listing}
 
@@ -428,11 +334,7 @@ const TUint8 KClassFromPriority[KNumPriorities] =
 	{
 	0,0,0,0,0,0,0,0,
 	0,0,0,0,1,1,1,1,
-	2,2,2,2,2,2,2,2,
-	2,2,2,3,3,3,3,3,
-	3,3,3,3,3,3,3,3,
-	3,3,3,3,3,3,3,3,
-	3,3,3,3,3,3,3,3,
+	/* middle priorities omitted */
 	3,3,3,3,3,3,3,3
 	};
 
@@ -448,21 +350,17 @@ const TUint K_LB_HeavyPriorityThreshold = 25;
 		{
 		if ((config & EKernelConfigSMPUnsafeCPU0)
 		 && iOwningProcess->iSMPUnsafeCount)
-			{
 			ni.iCpuAffinity = 0;
-			}
 		else
-			{
 			if ((config & EKernelConfigSMPUnsafeCompat)
 			 && iOwningProcess->iSMPUnsafeCount)
 				ni.iGroup = iOwningProcess->iSMPUnsafeGroup;
-			}
 		}
 #endif
 \end{minted}
 \caption{SMP priority classes, balance thresholds, and affinity handling.
-Source: \texttt{nkernsmp/sched.cpp}, \texttt{nkernsmp/nk\_bal.cpp}, and
-\texttt{kernel/sthread.cpp}.}
+Files: \texttt{nkernsmp/sched.cpp}, \texttt{nk\_bal.cpp}, and
+\texttt{sthread.cpp}.}
 \label{lst:sym-smp}
 \end{listing}
 
@@ -480,11 +378,6 @@ specific failure mode most likely to break a fixed-priority real-time system.
 
 \begin{listing}[H]
 \begin{minted}{cpp}
-EXPORT_C TThreadCleanup::TThreadCleanup()
-	: iThread(NULL)
-	{
-	}
-
 void TThreadCleanup::ChangePriority(TInt aNewPriority)
 	{
 	if (aNewPriority != iPriority)
@@ -500,13 +393,6 @@ void TThreadCleanup::ChangePriority(TInt aNewPriority)
 		}
 	}
 
-EXPORT_C void TThreadCleanup::Remove()
-	{
-	iThread->iCleanupQ.Remove(this);
-	if (iPriority>=iThread->iNThread.i_NThread_BasePri)
-		iThread->SetRequiredPriority();
-	}
-
 void DThread::SetRequiredPriority()
 	{
 	TInt p=iDefaultPriority;
@@ -517,7 +403,7 @@ void DThread::SetRequiredPriority()
 		SetActualPriority(p);
 	}
 \end{minted}
-\caption{Priority inheritance through cleanup-linked propagation. Source:
-\texttt{kernel/sthread.cpp}.}
+\caption{Priority inheritance through cleanup-linked propagation. File:
+\texttt{sthread.cpp}.}
 \label{lst:sym-priority-inheritance}
 \end{listing}
