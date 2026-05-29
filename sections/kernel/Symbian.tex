@@ -1,231 +1,409 @@
-\subsection{Symbian OS}
+\subsubsection{Symbian OS}
 
-\begin{center}
-\begin{minipage}{0.95\textwidth}
-\small\textbf{Source Note:} All source-file references in this discussion
-(\texttt{kernel/eka/}) are drawn from the Symbian Foundation's open-source
-EKA2 kernel repository:\par
-\centering\url{https://github.com/SymbianSource/oss.FCL.sf.os.kernelhwsrv}
-\end{minipage}
-\end{center}
-\medskip
+\sourcenotebox{\textbf{Source Note:} The listings below are taken from the
+local Symbian EPOC Kernel Architecture 2 (EKA2) source tree in this workspace
+under \texttt{kernel/eka/}.
+The upstream repository is
+\url{https://github.com/SymbianSource/oss.FCL.sf.os.kernelhwsrv}. Each caption
+names the relevant source file or files.}
 
-Symbian OS employs the \textbf{EKA2} (EPOC Kernel Architecture 2), a
-two-layer hybrid kernel design that combines a minimal, hardware-near
-\textit{nanokernel} with a more capable \textit{kernel executive} layer
-\citep{sales2005}. The core source code for EKA2 is organised in three
-directories: \texttt{kernel/eka/nkern/} (nanokernel), \texttt{kernel/eka/
-kernel/} (kernel proper), and \texttt{kernel/eka/include/} (headers and
-interface definitions) \citep{symbian_eka2_kernel}. This architecture was
-purpose-built for mobile phones in the late 1990s and 2000s, where devices
-had 4--32~MB of RAM, battery-power constraints, and real-time telephony
-requirements \citep{symbian_eka2_kernel}.
+Symbian EKA2 is best understood as a layered nanokernel-plus-kernel design.
+The nanokernel exports the minimal execution substrate, while the larger kernel
+executive builds processes, drivers, inter-process communication (IPC), memory
+objects, and security policy on top of that substrate
+\citep{sales2005, symbian_eka2_kernel}. This is not a pure microkernel because
+drivers and file systems still run in kernel space, but it is also not a flat
+monolith because the nanokernel boundary is explicit in the headers, boot
+flow, and object model.
 
-\subsubsection{Architecture: A Layered Nanokernel + Kernel Hybrid}
+\paragraph{Architecture and Design}
 
-The EKA2 is neither a pure microkernel nor a traditional monolithic kernel.
-Instead, it separates concerns into two distinct layers with an enforced,
-one-direction dependency: the nanokernel provides the absolute
-minimum---threads, a 64-priority-level preemptive scheduler
-(\texttt{KNumPriorities} is defined as 64 in \texttt{nkern/nkern.h}
-\citep{symbian_eka2_kernel}), fast mutexes and spin locks with ordered
-deadlock prevention (\texttt{TSpinLock} with the \texttt{TOrder} enum in
-\texttt{nkern/nkern.h}), nanokernel timers (\texttt{NTimer}), and
-interrupt-service-routine (ISR) dispatch \citep{sales2005}---while the
-kernel layer builds on top to provide processes, inter-process communication
-(IPC), memory objects (chunks), device driver frameworks, and platform
-security. The nanokernel is designed to be buildable as a standalone unit
-(via the \texttt{\_\_STANDALONE\_NANOKERNEL\_\_} macro in \texttt{nkern.h})
-de-coupled from the full OS \citep{symbian_eka2_kernel}, and a strict layering
-rule enforced by header-inclusion discipline prevents it from ever calling
-upward into the kernel layer.
+The architectural split is visible in the nanokernel header itself.
+Listing~\ref{lst:kernel-nkern-boundary} shows that the standalone nanokernel
+build path is explicit and that the header surface is centered on low-level
+facilities such as queues, deferred function calls (DFCs), tracing, atomics,
+fault entry, and idle handling. This is the smallest execution substrate on
+which the larger kernel is intended to depend.
 
-The kernel's bootstrap sequence begins in
-\texttt{KernelMain()} (\texttt{kernel/arm/cinit.cpp}), which calls
-\texttt{P::CreateVariant()} to load the ASIC/hardware variant, then
-calls \texttt{K::InitialiseMicrokernel()} in \texttt{kernel/sinit.cpp}
-\citep{symbian_eka2_kernel}. This function creates the null thread, the
-initial process, the kernel heap, and per-CPU data structures before
-spawning the Supervisor thread, which calls \texttt{K::Init3} to
-create the DFC queues (\texttt{DfcQ0}, \texttt{DfcQ1},
-\texttt{TimerDfcQ} in \texttt{kernel/sglobals.cpp})
-and starts the system tick \citep{symbian_eka2_kernel}.
+\begin{listing}[H]
+\begin{minted}{cpp}
+#ifdef	__STANDALONE_NANOKERNEL__
+#undef	__IN_KERNEL__
+#define	__IN_KERNEL__
+#endif
 
-At compile time, the kernel is paired with one of four swappable memory
-models---\textit{direct} (single, fixed address space for low-end devices),
-\textit{flexible} (full virtual memory with per-process address spaces),
-\textit{moving} (MMU-based with memory defragmentation), and
-\textit{multiple} (the model used on most ARM smartphones), exposed through
-the \texttt{M::} namespace interface---allowing the same kernel codebase to
-target hardware ranging from simple feature phones to smartphone-class ARM
-processors \citep{sales2005, symbian_eka2_kernel}.
+#include <e32const.h>
+#include <nklib.h>
+#include <dfcs.h>
+#include <nk_trace.h>
+#include <e32atomics.h>
 
-\subsubsection{Kernel-Space vs.\ User-Space Separation}
+extern "C" {
+IMPORT_C void NKFault(const char* file, TInt line);
+void NKIdle(TUint32 aStage);
+}
+\end{minted}
+\caption{Standalone nanokernel boundary and low-level surface. Source:
+\texttt{include/nkern/nkern.h}.}
+\label{lst:kernel-nkern-boundary}
+\end{listing}
 
-Symbian enforces the user-kernel boundary with the ARM MMU. The
-\textit{Super Page} structure (\texttt{SSuperPageBase}, defined in
-\texttt{kernel/kernboot.h}) is a pinned, shared-memory block mapped into
-every process's address space, holding system-global data such as ROM and
-RAM sizes, the page directory physical address, and ASIC/variant pointers
-\citep{symbian_eka2_kernel}. Each user process receives its own address space
-created by the memory-model layer, and the kernel runs in ARM Supervisor
-(SVC) mode while user code executes in User (USR) mode \citep{sales2005}.
+The layering also shows up in initialization. Once the first thread's
+nanokernel context is prepared, boot explicitly hands control to the memory
+model and then the variant or application-specific integrated circuit (ASIC)
+layer instead of fusing those concerns into a single monolithic startup
+routine. Listing~\ref{lst:kernel-init-split} captures that handoff.
 
-All user-to-kernel transitions go through the ARM SWI (Software Interrupt)
-instruction, dispatched via a fast-exec/slow-exec call table mechanism
-defined in \texttt{include/u32exec.h}, which provides \texttt{FAST\_EXEC0}
-and \texttt{SLOW\_EXEC0} macros that generate the SWI instructions with the
-appropriate exec-table index \citep{symbian_eka2_kernel}. Each thread carries
-its own pair of exec-table pointers, enabling different ``personality''
-layers to expose alternative system call interfaces atop the same kernel.
-The executive call dispatch on ARM is machine-coded (indicated by
-\texttt{\_\_FASTEXEC\_MACHINE\_CODED\_\_} in \texttt{kernel/kern\_priv.h}),
-replacing C++ with hand-optimised assembly in production builds
-\citep{symbian_eka2_kernel}.
+\begin{listing}[H]
+\begin{minted}{cpp}
+	info.iSlowExecTable = (const SSlowExecTable*)EpocSlowExecTable;
+	info.iParameterBlock = (const TUint32*)aInfo;
+	info.iParameterBlockSize = 0;
+	info.iCpuAffinity = 0;
+	info.iGroup = 0;
 
-When a user process attempts an illegal kernel memory access, the ARM Data
-Abort handler dispatches through the per-thread \texttt{EpocThreadHandlers}
-structure in \texttt{kernel/sthread.cpp}, which binds \texttt{Exc::Dispatch}
-as the exception handler for each thread \citep{symbian_eka2_kernel}. The
-kernel provides \texttt{TExcTrap}---a try/catch mechanism defined with the
-\texttt{XTRAP} macro in \texttt{kernel/kern\_priv.h}---for kernel code that
-must safely handle exceptions, and \texttt{TPagingExcTrap} (via
-\texttt{XTRAP\_PAGING}) for transparently resolving demand-paging faults
-\citep{symbian_eka2_kernel}. If no trap is active, the offending thread is
-terminated and its process is killed, but the kernel survives---a guarantee
-any MMU-based OS provides \citep{sales2005}.
+	TAny* ec = t->iNThread.iExtraContext;
+	TInt ecs = t->iNThread.iExtraContextSize;
+	NKern::Init(&t->iNThread, info);
+	t->iNThread.SetExtraContext(ec, ecs);
 
-For security, EKA2 (introduced in Symbian OS v9) added a capability-based
-Platform Security model. The \texttt{TCapability} enumeration in
-\texttt{include/e32capability.h} defines four key capability levels:
-\texttt{ECapabilityTCB} for trusted computing base access,
-\texttt{ECapabilityCommDD} for communication device drivers,
-\texttt{ECapabilityPowerMgmt} for power management, and
-\texttt{ECapabilityMultimediaDD} for multimedia drivers
-\citep{symbian_eka2_kernel}. The kernel's capability-checking implementation
-resides in \texttt{kernel/ssecure.cpp}, which validates process capabilities
-against required sets on every sensitive operation \citep{symbian_eka2_kernel}.
-This model is simpler than Linux's layered user/group DAC + POSIX
-capabilities + SELinux stack, but was well-suited to a closed mobile
-platform where all software was code-signed and vetted by the device
-manufacturer.
+	__KTRACE_OPT(KBOOT,DEBUGPRINT("NKern::CurrentThread() = %08x",
+		NKern::CurrentThread()));
 
-\subsubsection{Interrupt Handling: The DFC/IDFC Model}
+	M::Init2AP();
+	A::Init2AP();
+\end{minted}
+\caption{Boot-time handoff from nanokernel setup into the memory model and
+variant layer. Source: \texttt{kernel/sinit.cpp}.}
+\label{lst:kernel-init-split}
+\end{listing}
 
-A standout design feature of EKA2 is its \textbf{staged interrupt
-processing} chain, adapted from Digital Equipment Corporation's VMS
-operating system \citep{sales2005}. The implementation lives in
-\texttt{nkern/dfcs.cpp}, where the \texttt{TDfc} constructor supports three
-calling contexts: pure DFC (priority 0--7, where 7 is highest), IDFC
-(identified by \texttt{iPriority=0xff}, meaning it can only be queued via
-\texttt{TDfc::Add()} from an ISR), and DFC with a pre-bound queue
-\citep{symbian_eka2_kernel}. Interrupts flow through three stages:
+Compared with Linux, this is a more deliberately stratified kernel interior.
+Compared with QNX, it still keeps too much functionality in kernel space to
+provide strong component restartability.
 
-\begin{enumerate}
-  \item \textbf{ISR} (Interrupt Service Routine) --- runs with interrupts
-        disabled, performs minimal hardware acknowledgement, and queues
-        either an IDFC or DFC via \texttt{TDfc::Add()}.
-  \item \textbf{IDFC} (Immediate Deferred Function Call) --- runs in the
-        interrupt post-amble with interrupts enabled but the kernel locked;
-        must be extremely short and non-blocking.
-  \item \textbf{DFC} (Deferred Function Call) --- runs in a dedicated DFC
-        thread context with the kernel unlocked and full kernel services
-        available; handles the bulk of interrupt work and is preemptible
-        by higher-priority threads \citep{symbian_eka2_kernel}.
-\end{enumerate}
+\paragraph{Power and Mobile-First Behavior}
 
-The DFC system provides eight priority levels per queue
-(\texttt{KNumDfcPriorities} is 8 in \texttt{include/nkern/dfcs.h}), with
-per-thread DFC queues for device drivers and three shared system DFC queues
-(\texttt{K::DfcQ0}, \texttt{K::DfcQ1}, and \texttt{K::TimerDfcQ}, declared
-in \texttt{kernel/sglobals.cpp}) for general kernel use
-\citep{symbian_eka2_kernel}. These queues are initialised in \texttt{K::Init3()}
-(in \texttt{kernel/sinit.cpp}) with priority levels 27 and 48 respectively,
-and their threads are marked as system-permanent so they cannot exit
-\citep{symbian_eka2_kernel}. This design yields very short interrupt-off
-windows---typically just the ISR prologue in assembly (a few dozen ARM
-instructions)---making EKA2 well-suited for the bounded-latency requirements
-of GSM/CDMA protocol stacks \citep{sales2005}.
+Symbian was designed for battery-constrained phones, and the idle path proves
+it. Listing~\ref{lst:kernel-power} shows that when the scheduler runs out of
+work, the kernel first asks a central processing unit (CPU) idle handler, then
+the power model, and only then falls back to the ASIC-specific idle hook. The
+power subsystem is therefore not an afterthought layered on top of scheduling;
+scheduler quiescence and power management are treated as closely related
+events.
 
-\subsubsection{Modularity and Extensibility}
+\begin{listing}[H]
+\begin{minted}{cpp}
+extern "C" void NKIdle(TUint32 aStage)
+	{
+	SCpuIdleHandler* cih = NKern::CpuIdleHandler();
+#ifdef __SMP__
+	TSubScheduler& ss = SubScheduler();
+	if (cih && cih->iHandler)
+		(*cih->iHandler)(cih->iPtr, aStage, ss.iUncached);
+#else
+	if (cih && cih->iHandler)
+		(*cih->iHandler)(cih->iPtr, aStage);
+#endif
+	else if (K::PowerModel)
+		K::PowerModel->CpuIdle();
+	else
+		Arm::TheAsic->Idle();
+	}
 
-The kernel is modular within its layers but linked as a monolithic
-executable image (\texttt{ekern.exe}). Its key extension mechanisms include:
+class DPowerManager : public DPowerModel
+	{
+public:
+	void CpuIdle();
+	void RegisterUserActivity(const TRawEvent& anEvent);
+	TInt PowerHalFunction(TInt aFunction, TAny* a1, TAny* a2);
+	void AbsoluteTimerExpired();
+	void SystemTimeChanged(TInt anOldTime, TInt aNewTime);
+	TSupplyStatus MachinePowerStatus();
+	};
+\end{minted}
+\caption{Idle handling and power-model integration. Source:
+\texttt{kernel/arm/cinit.cpp} and \texttt{kernel/power.cpp}.}
+\label{lst:kernel-power}
+\end{listing}
 
-\begin{itemize}
-  \item \textbf{LDD/PDD driver model} --- Physical Device Drivers (PDDs)
-        handle hardware specifics, while Logical Device Drivers (LDDs)
-        provide the OS integration API. The \texttt{Kern::InstallLogicalDevice()}
-        function in \texttt{kernel/device.cpp} registers a logical device
-        with the kernel's object container, and \texttt{DoLogicalDeviceLoad()}
-        resolves a \texttt{TLogicalDeviceNew} factory from a code-segment DLL
-        at runtime to instantiate the driver \citep{symbian_eka2_kernel}.
-  \item \textbf{Personality layers} --- alternative RTOS APIs can be layered
-        atop Symbian nanokernel primitives, wrapping \texttt{NThread},
-        \texttt{NFastSemaphore}, and \texttt{NTimer} objects behind a custom
-        task interface (see \texttt{personality/example/personality.cpp})
-        \citep{symbian_eka2_kernel}.
-  \item \textbf{Variant/ASIC DLLs} --- hardware-platform support is
-        encapsulated in variant DLLs loaded at boot by
-        \texttt{A::CreateVariant()} in \texttt{kernel/arm/cinit.cpp}, which
-        calls the DLL's exported ordinal-1 initialisation function and
-        populates \texttt{K::VariantData[31]} with per-variant pointers,
-        enabling a single kernel binary to support multiple hardware designs
-        \citep{symbian_eka2_kernel}.
-\end{itemize}
+\paragraph{Drivers, Objects, and Extensibility}
 
-However, compared to Linux's loadable kernel module system, Symbian's
-extension system is more constrained: drivers and extensions are typically
-loaded at boot and unloading is not a primary design consideration,
-reflecting the mobile-phone model where runtime reconfiguration is rare
-\citep{sales2005}.
+Symbian keeps drivers in kernel space, but it still exposes a clear and fairly
+systematic registration path. Listing~\ref{lst:kernel-drivers-objects} shows
+three parts of that structure: logical devices are installed as kernel
+objects, the kernel keeps shared global service queues for DFC and system work,
+and core objects receive stable IDs at construction time. That is what makes
+EKA2 a structured embedded monolith rather than a loose collection of
+subsystems.
 
-\subsubsection{Performance, Security, and Fault Isolation}
+\begin{listing}[H]
+\begin{minted}{cpp}
+EXPORT_C TInt Kern::InstallLogicalDevice(DLogicalDevice* aDevice)
+	{
+	aDevice->SetProtection(DObject::EGlobal);
+	aDevice->iObjectFlags |= DObject::EObjectExtraReference;
+	TInt r=aDevice->Install();
+	if (r==KErrNone)
+		r=K::AddObject(aDevice,ELogicalDevice);
+	return r;
+	}
 
-The nanokernel minimalism gives EKA2 strong real-time characteristics:
-critical paths such as context switches and interrupt entry/exit are
-implemented in hand-optimised ARM assembly, indicated by preprocessor macros
-\texttt{\_\_FASTEXEC\_MACHINE\_CODED\_\_}, \texttt{\_\_MMU\_MACHINE\_CODED\_\_},
-and \texttt{\_\_SCHEDULER\_MACHINE\_CODED\_\_} in \texttt{kernel/kern\_priv.h}
-\citep{symbian_eka2_kernel}. The \texttt{TScheduler} in \texttt{nkern/sched.cpp}
-implements preemptive round-robin within each priority level with a
-configurable timeslice; when a thread blocks, it receives a fresh timeslice
-(\texttt{iTime = iTimeslice}) \citep{symbian_eka2_kernel}. IPC in Symbian uses
-shared chunks with zero-copy message passing: the
-\texttt{RMessageK}/\texttt{RMessageU2} classes in \texttt{kernel/sipc.cpp}
-define the kernel- and user-side message formats, and
-\texttt{K::USafeWrite()} safely copies data to user space during IPC
-completion, catching faults via the \texttt{TIpcExcTrap} mechanism rather
-than crashing \citep{symbian_eka2_kernel}.
+TMachineConfig* K::MachineConfig;
+DThread* K::TheKernelThread;
+DProcess* K::TheKernelProcess;
+TDfcQue* K::DfcQ0;
+TDfcQue* K::DfcQ1;
+TDfcQue* K::TimerDfcQ;
+DObjectCon* K::Containers[ENumObjectTypes];
 
-The kernel's object model is built on the \texttt{DObject} base class
-(\texttt{kernel/object.cpp}), whose constructor atomically assigns a
-unique 64-bit object ID using an atomic addition and initialises
-the reference count to 1 \citep{symbian_eka2_kernel}. All kernel objects
-(threads, processes, chunks, mutexes, semaphores, servers, code segments,
-logical devices, logical channels) are tracked in a uniform
-\texttt{DObjectCon} container array indexed by \texttt{EObjectType} in
-\texttt{K::Containers[ENumObjectTypes]}, allowing type-safe traversal and
-cleanup \citep{symbian_eka2_kernel}.
+EXPORT_C DObject::DObject()
+	{
+	iAccessCount=1;
+	iObjectId = __e32_atomic_add_ord64(&NextObjectId, TUint64(1<<18));
+	}
+\end{minted}
+\caption{Kernel driver installation, shared global state, and base object
+construction. Source: \texttt{kernel/device.cpp}, \texttt{kernel/sglobals.cpp},
+and \texttt{kernel/object.cpp}.}
+\label{lst:kernel-drivers-objects}
+\end{listing}
 
-The key trade-off is that \textbf{drivers and file systems run in kernel
-space}. This eliminates IPC overhead per I/O operation---critical on
-100--400~MHz ARM processors---but means a null-pointer dereference in a USB
-or display driver triggers a \texttt{Kern::Fault} panic that halts the
-entire system. The thread state machine in \texttt{kernel/sthread.cpp}
-exemplifies this: when a thread enters an invalid state, the
-\texttt{DefaultUnknownStateHandler} calls \texttt{Kern::Fault("THREAD STATE",
-aThread->iMState)}, which brings down the whole kernel
-\citep{symbian_eka2_kernel}. There is no mechanism to restart an individual
-kernel component. User-process failures, by contrast, are fully isolated;
-the \texttt{DProcess} destructor in \texttt{kernel/sprocess.cpp} releases all
-command-line buffers, environment data, handles, chunks, threads, and
-semaphores held by the terminated process \citep{symbian_eka2_kernel}.
+The benefit is low overhead and straightforward entry points. The cost is weak
+runtime fault isolation: a driver bug is still a kernel bug.
 
-For its era and target hardware, this design was an appropriate trade-off.
-All kernel-space code was provided by the device manufacturer and underwent
-extensive testing and code signing, managing risk at the development stage
-rather than at runtime. The nanokernel's clean architectural boundary---a
-minimal, auditable, machine-coded core with no upward dependencies---remains
-an instructive pattern in embedded kernel design \citep{sales2005,
-  symbian_eka2_kernel}.
+\paragraph{User Space, System Calls, and Safe User Memory}
+
+Symbian enforces the user-kernel boundary with per-process address spaces and a
+shared super page. Listing~\ref{lst:kernel-userspace-boundary} shows both
+sides: the super page makes selected global state intentionally visible in each
+process, while executive-call tables and per-thread dispatch pointers keep the
+system-call path explicit and inspectable instead of implicit or opaque.
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+struct SSuperPageBase
+	{
+	TInt		iRamDriveSize;
+	TInt		iTotalRomSize;
+	TInt		iTotalRamSize;
+	TLinAddr	iPageDir;
+	TInt		iKernelFault;
+	TLinAddr	iRamBootData;
+	TLinAddr	iRomBootData;
+	TLinAddr	iBootTable;
+	TLinAddr	iCodeBase;
+	TUint32		iBootFlags;
+	TLinAddr	iBootAlloc;
+	TLinAddr	iMachineData;
+	TUint		iActiveVariant;
+	TLinAddr	iPrimaryEntry;
+	TInt		iInitialHeapSize;
+	TInt		iDebugPort;
+	TUint		iCpuId;
+	TLinAddr	iUncachedAddress;
+	TLinAddr	iRootDirList;
+	TInt		iHwStartupReason;
+	};
+
+#define	FAST_EXEC_BEGIN	\
+	GLDEF_D const TUint32 EpocFastExecTable[] =		\
+		{
+
+#define	SLOW_EXEC_BEGIN	\
+	GLDEF_D const TUint32 EpocSlowExecTable[] =		\
+		{
+
+	const SNThreadHandlers* iHandlers;
+	const SFastExecTable* iFastExecTable;
+	const SSlowExecEntry* iSlowExecTable;
+	TLinAddr iSavedSP;
+\end{minted}
+\caption{Shared super-page state and explicit executive-call dispatch
+machinery. Source: \texttt{include/kernel/kernboot.h},
+\texttt{include/kernel/execs.h}, and \texttt{include/nkern/nk\_priv.h}.}
+\label{lst:kernel-userspace-boundary}
+\end{listing}
+
+Because user pointers are unsafe by default, sensitive kernel-to-user crossings
+are wrapped in trap harnesses and safe-copy helpers. Listing~\ref{lst:kernel-safe-user}
+shows the ordinary and paging-aware exception traps together with a
+\texttt{USafeWrite()}-based IPC callback path. Symbian still runs many services
+in kernel mode, but it does not assume user memory can be touched recklessly.
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+class TExcTrap
+	{
+public:
+	IMPORT_C TInt Trap();
+	IMPORT_C TInt Trap(TExcTrapHandler aHandler);
+	inline void UnTrap();
+	IMPORT_C void Exception(TInt aResult);
+public:
+	TUint32 iState[EXC_TRAP_CTX_SZ];
+	TExcTrapHandler iHandler;
+	DThread* iThread;
+	};
+
+class TPagingExcTrap
+	{
+public:
+	TInt Trap();
+	inline void UnTrap();
+	void Exception(TInt aResult);
+public:
+	TUint32 iState[EXC_TRAP_CTX_SZ];
+	DThread* iThread;
+	};
+
+#define XTRAP_PAGING(_r,_s)	{								\
+							TPagingExcTrap __t;				\
+							if (((_r)=__t.Trap())==0)		\
+								{							\
+								_s;							\
+								__t.UnTrap();				\
+								}							\
+							}
+
+void TServerMessage::CallbackFunc(TAny* aData, TUserModeCallbackReason aReason)
+	{
+	TServerMessage* req = (TServerMessage*)aData;
+	if (aReason == EUserModeCallbackRun && req->iResult == KErrNone)
+		{
+		RMessageU2 userData(*req->iMessageData);
+		K::USafeWrite(req->iMessagePtr, &userData, sizeof(userData));
+		}
+	TClientRequest::CallbackFunc(aData, aReason);
+	}
+\end{minted}
+\caption{Exception trapping and safe user-memory crossing. Source:
+\texttt{include/kernel/kern\_priv.h} and \texttt{kernel/sipc.cpp}.}
+\label{lst:kernel-safe-user}
+\end{listing}
+
+\paragraph{Interrupts, Deferred Work, and Timers}
+
+Symbian uses a staged interrupt model. Listing~\ref{lst:kernel-interrupts}
+shows three distinct pieces of that design: global interrupt-dispatch state in
+the nanokernel, explicit DFC queue types and priorities, and timer completion
+that can be requested in DFC context. The design is a sensible embedded
+compromise: short work stays near interrupt context, while longer work is
+pushed into DFC threads.
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+extern "C" {
+SArmInterruptInfo ArmInterruptInfo;
+}
+
+TScheduler TheScheduler;
+
+const TInt KNumDfcPriorities=8;
+const TInt KMaxDfcPriority=KNumDfcPriorities-1;
+
+class TDfcQue : public TPriList<TDfc,KNumDfcPriorities>
+	{
+public:
+	IMPORT_C TDfcQue();
+	inline TBool IsEmpty();
+	static void ThreadFunction(TAny* aDfcQ);
+public:
+	NThreadBase* iThread;
+	};
+
+EXPORT_C TInt NTimer::OneShot(TInt aTime, TBool aDfc)
+	{
+	__NK_ASSERT_DEBUG(aTime>=0);
+	__NK_ASSERT_DEBUG(iFunction!=NULL);
+	TInt irq=NKern::DisableAllInterrupts();
+	if (iState!=EIdle)
+		{
+		NKern::RestoreInterrupts(irq);
+		return KErrInUse;
+		}
+	iCompleteInDfc=TUint8(aDfc?1:0);
+	iTriggerTime=TheTimerQ.iMsCount+(TUint32)aTime;
+	TheTimerQ.Add(this);
+	NKern::RestoreInterrupts(irq);
+	return KErrNone;
+	}
+\end{minted}
+\caption{Interrupt state, deferred-call queues, and timer completion policy.
+Source: \texttt{nkern/arm/ncglob.cpp}, \texttt{include/nkern/dfcs.h}, and
+\texttt{nkern/nk\_timer.cpp}.}
+\label{lst:kernel-interrupts}
+\end{listing}
+
+\paragraph{Platform Security and Capability Checks}
+
+Symbian's platform security model is capability-based. The capability list is
+defined in a shared header, and checks happen at the process or thread
+boundary. Listing~\ref{lst:kernel-capabilities} shows both the shared
+enumeration and the concrete process or thread check path in
+\texttt{ssecure.cpp}. This is simpler than Linux's layered discretionary,
+capability, and Linux Security Module (LSM)-based permission models, but it
+fits a signed, vendor-controlled phone ecosystem well.
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+enum TCapability
+	{
+	ECapabilityTCB				= 0,
+	ECapabilityCommDD			= 1,
+	ECapabilityPowerMgmt		= 2,
+	ECapabilityMultimediaDD		= 3,
+	};
+
+EXPORT_C TBool DProcess::DoHasCapability(TCapability aCapability,
+	const char* aContextText)
+	{
+	if (HasCapabilityNoDiagnostic(aCapability))
+		return ETrue;
+	return PlatSec::CapabilityCheckFail(this,aCapability,aContextText)==KErrNone;
+	}
+
+EXPORT_C TBool DThread::DoHasCapability(TCapability aCapability,
+	const char* aContextText)
+	{
+	if(iOwningProcess->HasCapabilityNoDiagnostic(aCapability))
+		return ETrue;
+	return PlatSec::CapabilityCheckFail(this,aCapability,aContextText)==KErrNone;
+	}
+\end{minted}
+\caption{Capability definitions and kernel-side capability enforcement. Source:
+\texttt{include/e32capability.h} and \texttt{kernel/ssecure.cpp}.}
+\label{lst:kernel-capabilities}
+\end{listing}
+
+\paragraph{Fault Handling and Stability}
+
+Fault isolation is where the limits of the design are most obvious. User-space
+failures are isolated by the memory management unit (MMU) and safe-copy
+scaffolding, but kernel-space failures remain catastrophic because drivers and
+core services share the scheduler's address space. Listing~\ref{lst:kernel-faults}
+shows how blunt the failure path is: the nanokernel exposes a direct fatal
+fault entry point, and the thread state machine treats impossible internal
+state as a kernel-fatal condition.
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+IMPORT_C void NKFault(const char* file, TInt line);
+#define FAULT()		NKFault(__FILE__,__LINE__)
+
+	__KTRACE_OPT(KTHREAD,Kern::Printf(
+		"UNKNOWN THREAD MSTATE!! thread %O Mstate=%d, operation=%d, parameter=%d",
+		aThread,aThread->iMState,anOperation,aParameter));
+	Kern::Fault("THREAD STATE",aThread->iMState);
+\end{minted}
+\caption{Kernel-fatal fault paths for nanokernel and thread-state corruption.
+Source: \texttt{include/nkern/nkern.h} and \texttt{kernel/sthread.cpp}.}
+\label{lst:kernel-faults}
+\end{listing}
+
+That places Symbian between Linux and QNX. It has better internal layering
+than a flat monolith, but it does not deliver the restartability or hard fault
+containment of a true user-space driver architecture. For its era and target
+hardware, that was a defensible trade-off: low overhead, explicit control, and
+a kernel structure a phone manufacturer could reason about, test, and ship on
+severely constrained devices \citep{sales2005, symbian_eka2_kernel}.

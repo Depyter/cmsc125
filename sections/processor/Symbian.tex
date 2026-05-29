@@ -1,0 +1,523 @@
+\subsubsection{Symbian OS}
+
+\sourcenotebox{\textbf{Source Note:} The quoted listings below are taken from
+the local Symbian EPOC Kernel Architecture 2 (EKA2) source tree in this
+workspace under \texttt{kernel/eka/}.
+The upstream repository is
+\url{https://github.com/SymbianSource/oss.FCL.sf.os.kernelhwsrv}. Each caption
+names the relevant source file or files.}
+
+Symbian EKA2 uses a \textbf{fixed-priority preemptive scheduler} with
+round-robin inside each priority level. The revised presentation follows the
+usual paper pattern of making a claim in prose, then pointing to a numbered
+listing that carries the supporting code \citep{symbian_eka2_kernel}.
+
+\paragraph{Scheduling Architecture}
+
+Runnable threads are organised by absolute priority rather than by a fairness
+score. EKA2 exposes 64 absolute scheduler priorities in
+\texttt{include/nkern/nkern.h}, and Listing~\ref{lst:sym-tprilistbase} shows
+that ready threads are stored in per-priority queues backed by a presence
+bitmap. That design makes lookup cheap and deterministic, which is exactly the
+trade-off Symbian wants for mobile workloads that care more about bounded
+latency than about global fairness \citep{sales2005, symbian_eka2_kernel}.
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+class TPriListBase
+	{
+public:
+	IMPORT_C TPriListBase(TInt aNumPriorities);
+	IMPORT_C TInt HighestPriority();
+	IMPORT_C TPriListLink* First();
+	IMPORT_C void Add(TPriListLink* aLink);
+	IMPORT_C void AddHead(TPriListLink* aLink);
+	IMPORT_C void Remove(TPriListLink* aLink);
+	IMPORT_C void ChangePriority(TPriListLink* aLink, TInt aNewPriority);
+
+	inline TBool NonEmpty() const
+		{ return iPresent[0]|iPresent[1]; }
+	inline TBool IsEmpty() const
+		{ return !NonEmpty();  }
+	inline TBool operator>(TInt p) const
+		{ return ((p<32) ? (iPresent[1] | (iPresent[0]>>p)>>1)
+		                 : (iPresent[1]>>(p-32))>>1 ); }
+public:
+	union
+		{
+		TUint iPresent[2];
+		TUint64 iPresent64;
+		};
+	SDblQueLink* iQueue[1];
+	};
+\end{minted}
+\caption{Priority bitmap and ready-queue anchors in
+\texttt{include/nkern/nklib.h}.}
+\label{lst:sym-tprilistbase}
+\end{listing}
+
+The concrete scheduler object reinforces that priority-first design.
+Listing~\ref{lst:sym-tscheduler} shows that \texttt{TScheduler} tracks the
+current thread, deferred function call queues, delayed work, and reschedule
+state rather than a large body of fairness metadata. That contrasts sharply
+with Linux's Completely Fair Scheduler (CFS), which is structured around
+fairness accounting.
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+class TScheduler : public TPriListBase
+	{
+public:
+	TScheduler();
+	void Remove(NThreadBase* aThread);
+	void RotateReadyList(TInt aPriority);
+	void QueueDfcs();
+	static void Reschedule();
+	static void YieldTo(NThreadBase* aThread);
+	void TimesliceTick();
+	IMPORT_C static TScheduler* Ptr();
+	inline void SetProcessHandler(TLinAddr aHandler)
+		{iProcessHandler=aHandler;}
+private:
+	SDblQueLink* iExtraQueues[KNumPriorities-1];
+public:
+	TUint8 iRescheduleNeededFlag;
+	TUint8 iDfcPendingFlag;
+	TInt iKernCSLocked;
+	SDblQue iDfcs;
+	TLinAddr iMonitorExceptionHandler;
+	TLinAddr iProcessHandler;
+	TLinAddr iRescheduleHook;
+	TUint8 iInIDFC;
+	NFastMutex iLock;
+	NThreadBase* iCurrentThread;
+	TAny* iAddressSpace;
+	SDblQue iIdleDfcs;
+	SDblQue iDelayedQ;
+	TDfc iDelayDfc;
+	TUint iMadeReadyCounter;
+	TUint iMadeUnReadyCounter;
+	TUint iTimeSliceExpireCounter;
+	};
+\end{minted}
+\caption{Core scheduler state in \texttt{include/nkern/nk\_priv.h}.}
+\label{lst:sym-tscheduler}
+\end{listing}
+
+\paragraph{Priority and Timeslice Model}
+
+Symbian does not treat thread priority as one flat application-controlled
+number. Instead, it combines an 8-level process-priority band with a relative
+thread priority, then maps that pair to an absolute scheduler priority through
+the lookup logic in Listing~\ref{lst:sym-priority-table}
+\citep{symbian_eka2_kernel}. The table makes the policy explicit: priorities
+are clustered into bands, real-time ranges are capability-gated, and a
+thread's effective priority depends partly on the role of its owning process.
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+enum TProcPriority
+	{
+	EProcPriorityLow=0,
+	EProcPriorityBackground=1,
+	EProcPriorityForeground=2,
+	EProcPriorityHigh=3,
+	EProcPrioritySystemServer1=4,
+	EProcPrioritySystemServer2=5,
+	EProcPrioritySystemServer3=6,
+	EProcPriorityRealTimeServer=7,
+	};
+
+LOCAL_D const TUint8 ThreadPriorityTable[64] =
+	{
+/*Low*/               1,     1,     2,     3,  4,  5, 22,  0,
+/*Background*/        3,     5,     6,     7,  8,  9, 22,  0,
+/*Foreground*/        3,    10,    11,    12, 13, 14, 22,  0,
+/*High*/              3,    17,    18,    19, 20, 22, 23,  0,
+/*SystemServer1*/     9,    15,    16,    21,
+                       KPrioritySystemServerMore, 25, 28, 0,
+/*SystemServer2*/     9,    15,    16,    21,
+                       KPrioritySystemServerMore, 25, 28, 0,
+/*SystemServer3*/     9,    15,    16,    21,
+                       KPrioritySystemServerMore, 25, 28, 0,
+/*RealTimeServer*/   18,    26,    27,    28, 29, 30, 31, 0
+	};
+
+TInt DThread::CalcDefaultThreadPriority()
+	{
+	TInt r;
+	TInt tp=iThreadPriority;
+	if (tp>=0)
+		r=(tp<KNumPriorities)?tp:KNumPriorities-1;
+	else
+		{
+		tp+=8;
+		if (tp<0)
+			tp=0;
+		TInt pp=iOwningProcess->iPriority;
+		TInt i=(pp<<3)+tp;
+		r=ThreadPriorityTable[i];
+		if ((r > KMaxPriorityWithoutProtServ) &&
+			!(this->HasCapability(ECapabilityProtServ,
+			  __PLATSEC_DIAGNOSTIC_STRING(
+			    "Warning: thread priority capped to below realtime range"))))
+			r = KMaxPriorityWithoutProtServ;
+		}
+	return r;
+	}
+\end{minted}
+\caption{Process-priority bands and thread-priority mapping. Source:
+\texttt{include/kernel/kern\_priv.h} and \texttt{kernel/sthread.cpp}.}
+\label{lst:sym-priority-table}
+\end{listing}
+
+Timeslice handling is equally direct. Listing~\ref{lst:sym-timeslice} combines
+the per-thread time accounting fields, the default 20~ms user timeslice, and
+the scheduler routines that decrement quanta, restore them on block, and rotate
+the ready list among equal-priority peers. The resulting behavior is exactly
+what the implementation suggests: CPU-bound peers share by round-robin,
+input/output (I/O)-bound threads tend to come back with a fresh quantum, and
+lower-priority work can starve if higher-priority threads never block.
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+TInt iTime;
+TInt iTimeslice;
+
+enum {EDefaultUserTimeSliceMs = 20};
+
+void TScheduler::TimesliceTick()
+	{
+	NThreadBase* pC=iCurrentThread;
+	if (pC->iTime>0 && --pC->iTime==0)
+		RescheduleNeeded();
+	}
+
+void TScheduler::Remove(NThreadBase* aThread)
+	{
+	__NK_ASSERT_DEBUG(!aThread->iHeldFastMutex);
+	iMadeUnReadyCounter++;
+	aThread->iTime=aThread->iTimeslice;
+	TPriListBase::Remove(aThread);
+	}
+
+void TScheduler::RotateReadyList(TInt p)
+	{
+	__NK_ASSERT_DEBUG(p>=0 && p<KNumPriorities);
+	SDblQueLink* pQ=iQueue[p];
+	if (pQ)
+		{
+		SDblQueLink* pN=pQ->iNext;
+		if (pN!=pQ)
+			{
+			NThread* pT=(NThread*)pQ;
+			pT->iTime=pT->iTimeslice;
+			iQueue[p]=pN;
+			if (pQ==iCurrentThread)
+				RescheduleNeeded();
+			}
+		}
+	}
+\end{minted}
+\caption{Timeslice state and round-robin rotation. Source:
+\texttt{include/nkern/nk\_priv.h}, \texttt{include/kernel/kern\_priv.h}, and
+\texttt{nkern/sched.cpp}.}
+\label{lst:sym-timeslice}
+\end{listing}
+
+\paragraph{Process and Thread Model}
+
+Symbian uses a \textbf{1:1 kernel-thread model}: every \texttt{DThread}
+corresponds to a real nanokernel thread, with no user-level scheduler sitting
+above it \citep{symbian_eka2_kernel}. Process-level priority still matters,
+however, because changing the process band triggers a recalculation of the
+owned threads' effective priorities. Listing~\ref{lst:sym-process-setpriority}
+shows that \texttt{DProcess::SetPriority()} walks the process thread list and
+recomputes each thread's effective priority.
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+TInt DProcess::SetPriority(TProcessPriority aPriority)
+	{
+	TInt p=ConvertPriority(aPriority);
+	if (p<0)
+		return KErrArgument;
+	if (iExitType!=EExitPending)
+		return KErrDied;
+	__KTRACE_OPT(KPROC,Kern::Printf("Process %O SetPriority(%d)",this,p));
+	TInt r=WaitProcessLock();
+	__KTRACE_FAIL(r,Kern::Printf("PSP: %d",r));
+	if (r!=KErrNone)
+		return KErrDied;
+#ifdef BTRACE_THREAD_PRIORITY
+	BTrace8(BTrace::EThreadPriority,BTrace::EProcessPriority,this,p);
+#endif
+	NKern::LockSystem();
+	iPriority=p;
+	SDblQueLink* pLink=iThreadQ.First();
+	while (pLink!=&iThreadQ.iA)
+		{
+		DThread* pT=_LOFF(pLink,DThread,iProcessLink);
+		pT->SetThreadPriority(pT->iThreadPriority);
+		pLink=pLink->iNext;
+		NKern::FlashSystem();
+		}
+	NKern::UnlockSystem();
+	SignalProcessLock();
+	return KErrNone;
+	}
+\end{minted}
+\caption{Process-priority propagation in \texttt{kernel/sprocess.cpp}.}
+\label{lst:sym-process-setpriority}
+\end{listing}
+
+Thread creation is split between the executive and the nanokernel.
+Listings~\ref{lst:sym-thread-create-exec} and
+\ref{lst:sym-thread-create-nkern} show the handoff clearly: the executive
+allocates the supervisor stack and fills out an \texttt{SNThreadCreateInfo},
+then the ARM nanokernel constructs the initial saved register frame. The main
+advantage is clarity. A blocking kernel operation blocks the real thread
+directly, but each thread also consumes actual kernel resources, so the model
+scales less gracefully than designs intended for very large thread counts.
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+TInt DThread::DoCreate(SThreadCreateInfo& aInfo)
+	{
+	iSupervisorStackSize=aInfo.iSupervisorStackSize;
+	if (iSupervisorStackSize==0)
+		iSupervisorStackSize=K::SupervisorThreadStackSize;
+	if (iThreadType==EThreadInitial || iThreadType==EThreadAPInitial
+	 || iThreadType==EThreadMinimalSupervisor)
+		iSupervisorStack=aInfo.iSupervisorStack;
+	TInt r=KErrNone;
+	if (!iSupervisorStack)
+		r=AllocateSupervisorStack();
+	if (r!=KErrNone)
+		return r;
+	SNThreadCreateInfo ni;
+	ni.iFunction=EpocThreadFunction;
+	ni.iPriority=1;
+	ni.iTimeslice = (iThreadType==EThreadMinimalSupervisor
+	              || iThreadType==EThreadAPInitial
+	              || iThreadType==EThreadInitial)
+	               ? -1
+	               : NKern::TimesliceTicks(EDefaultUserTimeSliceMs*1000);
+	ni.iHandlers = &EpocThreadHandlers;
+	ni.iFastExecTable=(const SFastExecTable*)EpocFastExecTable;
+	ni.iSlowExecTable=(const SSlowExecTable*)EpocSlowExecTable;
+	ni.iParameterBlock=(const TUint32*)&aInfo;
+	ni.iParameterBlockSize=aInfo.iTotalSize;
+	ni.iStackBase=iSupervisorStack;
+	ni.iStackSize=iSupervisorStackSize;
+	}
+\end{minted}
+\caption{Executive-side thread setup. Source: \texttt{kernel/sthread.cpp}.}
+\label{lst:sym-thread-create-exec}
+\end{listing}
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+TInt NThread::Create(SNThreadCreateInfo& aInfo, TBool aInitial)
+	{
+	TInt r=NThreadBase::Create(aInfo,aInitial);
+	if (r!=KErrNone)
+		return r;
+	if (!aInitial)
+		{
+		TUint32* sp=
+			(TUint32*)(iStackBase+iStackSize-aInfo.iParameterBlockSize);
+		TUint32 r6=(TUint32)aInfo.iParameterBlock;
+		if (aInfo.iParameterBlockSize)
+			{
+			wordmove(sp,aInfo.iParameterBlock,aInfo.iParameterBlockSize);
+			r6=(TUint32)sp;
+			}
+		*--sp=(TUint32)__StartThread;
+		*--sp=0;
+		*--sp=0;
+		*--sp=0;
+		*--sp=0;
+		*--sp=0;
+		*--sp=r6;
+		*--sp=(TUint32)aInfo.iFunction;
+		*--sp=(TUint32)this;
+		*--sp=0x13;
+		*--sp=0;
+		*--sp=0;
+		}
+	}
+\end{minted}
+\caption{Nanokernel thread bootstrap frame construction. Source:
+\texttt{nkern/arm/ncthrd.cpp}.}
+\label{lst:sym-thread-create-nkern}
+\end{listing}
+
+\paragraph{Context Switching}
+
+The context-switch path is tightly coupled to the machine.
+Listing~\ref{lst:sym-reschedule} captures the hot reschedule path in
+\texttt{nkern/arm/ncsched.cia}: interrupts are masked, pending DFC work is
+checked, the current context is saved, and the bitmap-backed ready queues are
+consulted to find the highest-priority runnable thread. This is where Symbian's
+design priorities are most obvious. The kernel is not trying to build a large
+adaptive scheduler; it is trying to get from an interrupt or blocking event to
+the right next thread with as little overhead as possible.
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+__NAKED__ void TScheduler::Reschedule()
+	{
+	asm("ldr r0, __TheScheduler ");
+	asm("str lr, [sp, #-4]! ");
+	SET_INTS(r3, MODE_SVC, INTS_ALL_OFF);
+	asm("ldrb r1, [r0, #%a0]" : : "i"
+		_FOFF(TScheduler,iDfcPendingFlag));
+	asm("mov r2, #0 ");
+	asm("cmp r1, #0 ");
+	asm("start_resched: ");
+	asm("blne  " CSM_ZN10TScheduler9QueueDfcsEv);
+	asm("ldrb r1, [r0, #%a0]" : : "i"
+		_FOFF(TScheduler,iRescheduleNeededFlag));
+	SET_INTS_1(r3, MODE_SVC, INTS_ALL_ON);
+	asm("cmp r1, #0 ");
+	asm("beq no_resched_needed ");
+	SET_INTS_2(r3, MODE_SVC, INTS_ALL_ON);
+	asm("mrs r2, spsr ");
+	asm("ldr r1, [r0, #%a0]" : : "i"
+		_FOFF(TScheduler,iCurrentThread));
+	asm("stmfd sp!, {r2,r4-r11} ");
+	asm("str sp, [r1, #%a0]" : : "i"
+		_FOFF(NThread,iSavedSP));
+#ifdef __CPU_ARM_HAS_CLZ
+	CLZ(12,14);
+	asm("subs r12, r12, #32 ");
+	CLZcc(CC_EQ,12,1);
+	asm("rsb r12, r12, #31 ");
+#endif
+	asm("ldr r2, [r0, r12, lsl #2] ");
+	}
+\end{minted}
+\caption{Hot reschedule path in \texttt{nkern/arm/ncsched.cia}.}
+\label{lst:sym-reschedule}
+\end{listing}
+
+\paragraph{Behavior Under Different Workloads}
+
+The workload behavior follows directly from Listings~\ref{lst:sym-priority-table}
+and \ref{lst:sym-timeslice}. Equal-priority CPU-bound threads share the
+processor by round-robin. I/O-bound threads often perform well because blocking
+restores their timeslice. Lower-priority work may still starve if a
+higher-priority runnable thread never blocks. Symbian treats that outcome as an
+acceptable consequence of explicit priority policy rather than as a scheduling
+bug \citep{sales2005, symbian_eka2_kernel}.
+
+\paragraph{Multicore (Symmetric Multiprocessing, SMP) Support}
+
+When built with \texttt{\_\_SMP\_\_}, EKA2 preserves the fixed-priority model
+but changes the scheduler topology. Listing~\ref{lst:sym-smp} groups the three
+main pieces: a priority-to-class mapping for load balancing, explicit
+load-balancing thresholds, and thread-creation logic that records CPU-affinity
+or SMP-unsafe compatibility constraints. Symbian therefore adds balancing on
+top of strict priorities rather than replacing strict priorities with a fully
+fair scheduler.
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+const TUint8 KClassFromPriority[KNumPriorities] =
+	{
+	0,0,0,0,0,0,0,0,
+	0,0,0,0,1,1,1,1,
+	2,2,2,2,2,2,2,2,
+	2,2,2,3,3,3,3,3,
+	3,3,3,3,3,3,3,3,
+	3,3,3,3,3,3,3,3,
+	3,3,3,3,3,3,3,3,
+	3,3,3,3,3,3,3,3
+	};
+
+const TInt  K_LB_BalanceInterval      = 107;
+const TInt  K_LB_CpuLoadDiffThreshold = 128;
+const TUint K_LB_HeavyPriorityThreshold = 25;
+
+#ifdef __SMP__
+	TUint32 config = TheSuperPage().KernelConfigFlags();
+	ni.iGroup = 0;
+	ni.iCpuAffinity = KCpuAffinityAny;
+	if (iThreadType==EThreadUser)
+		{
+		if ((config & EKernelConfigSMPUnsafeCPU0)
+		 && iOwningProcess->iSMPUnsafeCount)
+			{
+			ni.iCpuAffinity = 0;
+			}
+		else
+			{
+			if ((config & EKernelConfigSMPUnsafeCompat)
+			 && iOwningProcess->iSMPUnsafeCount)
+				ni.iGroup = iOwningProcess->iSMPUnsafeGroup;
+			}
+		}
+#endif
+\end{minted}
+\caption{SMP priority classes, balance thresholds, and affinity handling.
+Source: \texttt{nkernsmp/sched.cpp}, \texttt{nkernsmp/nk\_bal.cpp}, and
+\texttt{kernel/sthread.cpp}.}
+\label{lst:sym-smp}
+\end{listing}
+
+\paragraph{Starvation, Priority Inheritance, and Fairness}
+
+The fixed-priority model inherently permits starvation across priority levels.
+To reduce the more damaging problem of priority inversion, EKA2 implements
+bounded priority inheritance through the thread cleanup queue.
+Listing~\ref{lst:sym-priority-inheritance} shows the key mechanism:
+\texttt{SetRequiredPriority()} raises the effective thread priority to the
+maximum of the thread's default priority and the highest inherited cleanup
+priority. This is a narrow but sensible mitigation. Symbian does not try to
+equalise long-term progress across all runnable work; instead, it fixes the
+specific failure mode most likely to break a fixed-priority real-time system.
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+EXPORT_C TThreadCleanup::TThreadCleanup()
+	: iThread(NULL)
+	{
+	}
+
+void TThreadCleanup::ChangePriority(TInt aNewPriority)
+	{
+	if (aNewPriority != iPriority)
+		{
+		if (iThread)
+			{
+			iThread->iCleanupQ.ChangePriority(this,aNewPriority);
+			if (++K::PINestLevel<KMaxPriorityInheritanceNesting)
+				iThread->SetRequiredPriority();
+			}
+		else
+			iPriority=TUint8(aNewPriority);
+		}
+	}
+
+EXPORT_C void TThreadCleanup::Remove()
+	{
+	iThread->iCleanupQ.Remove(this);
+	if (iPriority>=iThread->iNThread.i_NThread_BasePri)
+		iThread->SetRequiredPriority();
+	}
+
+void DThread::SetRequiredPriority()
+	{
+	TInt p=iDefaultPriority;
+	TInt c=iCleanupQ.HighestPriority();
+	if (c>p)
+		p=c;
+	if (p!=iNThread.i_NThread_BasePri)
+		SetActualPriority(p);
+	}
+\end{minted}
+\caption{Priority inheritance through cleanup-linked propagation. Source:
+\texttt{kernel/sthread.cpp}.}
+\label{lst:sym-priority-inheritance}
+\end{listing}

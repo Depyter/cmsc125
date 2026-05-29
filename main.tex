@@ -3,8 +3,43 @@
 \usepackage[a4paper, margin=1.5in]{geometry}
 \usepackage[hyphens]{url}
 \usepackage[natbibapa]{apacite}
+\usepackage{xcolor}
+\usepackage[cache=false]{minted}
 
 \setlength{\emergencystretch}{2em}
+\setcounter{secnumdepth}{4}
+\setcounter{tocdepth}{4}
+
+\definecolor{codebg}{RGB}{248, 248, 248}
+
+\usemintedstyle{friendly}
+\setminted{
+  fontsize=\small,
+  breaklines,
+  linenos,
+  frame=single,
+  framesep=2mm,
+  bgcolor=codebg,
+  tabsize=2
+}
+
+\makeatletter
+\renewcommand\paragraph{\@startsection{paragraph}{4}{\z@}%
+  {3.25ex \@plus 1ex \@minus .2ex}%
+  {1ex}%
+  {\normalfont\normalsize\bfseries}}
+\makeatother
+
+\newcommand{\sourcenotebox}[1]{%
+  \begin{center}%
+  \fbox{%
+    \begin{minipage}{0.92\textwidth}%
+    \small #1%
+    \end{minipage}%
+  }%
+  \end{center}%
+  \medskip
+}
 
 % Allow line breaks at underscores in URLs and relax spacing
 % to prevent overfull/underfull boxes
