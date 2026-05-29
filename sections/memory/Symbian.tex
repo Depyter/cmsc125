@@ -1,3 +1,425 @@
 \subsubsection{Symbian OS}
 
-\emph{To be written.}
+\sourcenotebox{\textbf{Source Note:} The listings below are taken from the
+local Symbian EPOC Kernel Architecture 2 (EKA2) source tree in this workspace
+under \texttt{kernel/eka/}.
+The upstream repository is
+\url{https://github.com/SymbianSource/oss.FCL.sf.os.kernelhwsrv}. Each caption
+uses the shortest unambiguous path under \texttt{kernel/eka/}.}
+
+Symbian EKA2 treats memory management as several cooperating subsystems rather
+than one allocator. The code in \texttt{kernel/eka/} separates physical-page
+metadata, per-process virtual address spaces, process-visible mappings, demand
+paging, random-access memory (RAM) zoning, and recovery from fragmentation or
+pressure \citep{sales2005, symbian_eka2_kernel}. That division is what makes
+the memory behavior source-legible: most major policies are stated directly in
+types, creation paths, and paging interfaces.
+
+\paragraph{Memory Model and Address Spaces}
+
+The common memory-management-unit (MMU) base code already reveals the core
+model. Listing~\ref{lst:mem-pageinfo-addressspace} shows that each physical
+page carries explicit ownership and paging-state metadata, while each process
+gets a dedicated address-space object with its own page directory, virtual
+allocator, and mapping list. The comment also makes the operating-system
+address space identifier (OS ASID) policy explicit: the kernel refers to
+address spaces by indexed IDs rather than by raw pointers in most interfaces.
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+struct SPageInfo
+	{
+	enum TType
+		{
+		EInvalid=0,
+		EUnused=2,
+		EChunk=3,
+		EPageDir=7,
+		EPagedCode=11,
+		EPagedFree=14,
+		};
+
+	enum TState
+		{
+		EStateNormal = 0,
+		EStatePagedYoung = 1,
+		EStatePagedOld = 2,
+		EStatePagedDead = 3,
+		EStatePagedLocked = 4
+		};
+	};
+
+class DAddressSpace : public DReferenceCountedObject
+	{
+public:
+	static TInt New(TPhysAddr& aPageDirectory);
+	};
+\end{minted}
+\caption{Physical-page metadata and per-process address-space objects. Files:
+\texttt{mmubase.h} and \texttt{flexible/mmu/maddressspace.h}.}
+\label{lst:mem-pageinfo-addressspace}
+\end{listing}
+
+\paragraph{Process Setup and Paging Policy}
+
+Address-space creation happens in the normal process constructor rather than in
+a later memory-specific pass. Listing~\ref{lst:mem-process-create} shows that
+kernel processes stay in the kernel address space, while user processes call
+\texttt{MM::AddressSpaceAlloc()} and store the returned OS ASID. The same setup
+path also decides whether process data should be paged, so paging policy is
+bound to process creation and image flags instead of being bolted on after the
+fact.
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+TInt DMemModelProcess::SetPaging(const TProcessCreateInfo& aInfo)
+	{
+	TUint pagedFlags = aInfo.iFlags & TProcessCreateInfo::EDataPagingMask;
+	if (pagedFlags == TProcessCreateInfo::EDataPagingMask)
+		{
+		return KErrCorrupt;
+		}
+	if (aInfo.iAttr & ECodeSegAttKernel)
+		{
+		return KErrNone;
+		}
+	/* otherwise follow the configured data-paging policy */
+	TUint dataPolicy = TheSuperPage().KernelConfigFlags()
+		& EKernelConfigDataPagingPolicyMask;
+	if (dataPolicy == EKernelConfigDataPagingPolicyAlwaysPage)
+		{
+		iAttributes |= EDataPaged;
+		return KErrNone;
+		}
+	if (pagedFlags == TProcessCreateInfo::EDataPaged)
+		{
+		iAttributes |= EDataPaged;
+		}
+	return KErrNone;
+	}
+
+TInt DMemModelProcess::DoCreate(TBool aKernelProcess, TProcessCreateInfo& aInfo)
+	{
+	TInt r=KErrNone;
+
+	if (aKernelProcess)
+		{
+		iAttributes |= ESupervisor;
+		iOsAsid = KKernelOsAsid;
+		}
+	else
+		{
+		r = MM::AddressSpaceAlloc(iPageDir);
+		if (r>=0)
+			{
+			iOsAsid = r;
+			r = KErrNone;
+			}
+		}
+	if (r == KErrNone)
+		{
+		__e32_atomic_store_ord32(&iOsAsidRefCount, 1);
+		}
+	return r;
+	}
+\end{minted}
+\caption{Process address-space allocation and data-paging policy. File:
+\texttt{flexible/mprocess.cpp}.}
+\label{lst:mem-process-create}
+\end{listing}
+
+\paragraph{Data, BSS, Stack, and Code Regions}
+
+Process memory is assembled from explicit kernel memory objects and mappings,
+not from a single anonymous heap. Listing~\ref{lst:mem-data-stack} shows two
+variants of the same idea. In the flexible model, Symbian rounds the combined
+data and block-started-by-symbol (BSS) size to pages, allocates backing memory,
+and creates a user mapping for it. In the multiple model, it instead creates a
+disconnected user-data chunk sized for static data plus future stack growth.
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+TInt DMemModelProcess::CreateDataBssStackArea(TProcessCreateInfo& aInfo)
+	{
+	TInt r = KErrNone;
+	TInt dataBssSize = MM::RoundToPageSize(aInfo.iTotalDataSize);
+	if(dataBssSize)
+		{
+		DMemoryObject* memory;
+		TMemoryObjectType memoryType = iAttributes&EDataPaged
+			? EMemoryObjectPaged
+			: EMemoryObjectMovable;
+		r = MM::MemoryNew(memory,memoryType,MM::BytesToPages(dataBssSize));
+		if(r==KErrNone)
+			{
+			/* allocate pages, map them into the process, record the base */
+			r = MM::MemoryAlloc(memory,0,MM::BytesToPages(dataBssSize));
+			r = MM::MappingNew(iDataBssMapping,memory,EUserReadWrite,OsAsid());
+			iDataBssRunAddress = MM::MappingBase(iDataBssMapping);
+			}
+		}
+	return r;
+	}
+
+TInt DMemModelProcess::CreateDataBssStackArea(TProcessCreateInfo& aInfo)
+	{
+	TInt dataBssSize=Mmu::RoundToPageSize(aInfo.iTotalDataSize);
+	TInt maxSize=dataBssSize+PP::MaxStackSpacePerProcess;
+
+	SChunkCreateInfo cinfo;
+	cinfo.iGlobal=EFalse;
+	cinfo.iAtt=TChunkCreate::EDisconnected;
+	cinfo.iOperations=SChunkCreateInfo::EAdjust|SChunkCreateInfo::EAdd;
+	cinfo.iType=EUserData;
+	cinfo.iMaxSize=maxSize;
+	cinfo.iInitialTop=dataBssSize;
+	cinfo.iName.Set(KDollarDat);
+	cinfo.iOwner=this;
+	TLinAddr cb;
+	return NewChunk((DChunk*&)iDataBssStackChunk,cinfo,cb);
+	}
+\end{minted}
+\caption{Static-data and stack-region construction in the flexible and
+multiple memory models. Files: \texttt{flexible/mprocess.cpp} and
+\texttt{multiple/mprocess.cpp}.}
+\label{lst:mem-data-stack}
+\end{listing}
+
+Executable attachment then fixes the actual run addresses for code and data.
+Listing~\ref{lst:mem-codeseg-attach} shows that the process pulls those
+addresses from the code segment metadata, using one path for execute-in-place
+images and another for RAM-loaded images. The important point is that code,
+data, and export metadata all become part of process creation, not a later
+loader patch-up step outside the kernel memory model.
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+TInt DEpocProcess::AttachExistingCodeSeg(TProcessCreateInfo& aInfo)
+	{
+	DEpocCodeSeg& s=*(DEpocCodeSeg*)iTempCodeSeg;
+	if (s.iAttachProcess && s.iAttachProcess!=this)
+		return KErrAlreadyExists;
+	TInt r=CreateDataBssStackArea(aInfo);
+	if (r==KErrNone)
+		{
+		if (s.iXIP)
+			{
+			const TRomImageHeader& rih=s.RomInfo();
+			aInfo.iCodeLoadAddress=rih.iCodeAddress;
+			aInfo.iCodeRunAddress=rih.iCodeAddress;
+			aInfo.iDataRunAddress=rih.iDataBssLinearBase;
+			}
+		else
+			{
+			SRamCodeInfo& ri=s.RamInfo();
+			aInfo.iCodeRunAddress=ri.iCodeRunAddr;
+			aInfo.iDataRunAddress=ri.iDataRunAddr;
+			}
+		}
+	return r;
+	}
+\end{minted}
+\caption{Executable attachment and run-address assignment. File:
+\texttt{pprocess.cpp}.}
+\label{lst:mem-codeseg-attach}
+\end{listing}
+
+\paragraph{Demand Paging and Reclaim}
+
+Demand paging is not implicit background magic; the intended policy is
+documented in the headers. Listing~\ref{lst:mem-demand-paging} describes a live
+page list split into young and old pages, where faults on old pages rejuvenate
+them into the young list. The same listing also shows the pager interface for
+handling a fault, freeing cache pages for the rest of the system, flushing
+paged regions, and reclaiming previously donated pages. This is a pseudo Most
+Recently Used (MRU) design rather than an exact least recently used policy.
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+/**
+Young pages are accessible; old pages fault and are moved back to the young
+list. If no free RAM page is available, the oldest live page is recycled.
+*/
+class DemandPaging : public RamCacheBase
+	{
+public:
+	virtual TInt Fault(TAny* aExceptionInfo)=0;
+	};
+
+class DPager
+	{
+public:
+	TBool GetFreePages(TInt aNumPages);
+	TInt HandlePageFault(/* fault context omitted */);
+	void FlushAll();
+	TInt FlushRegion(DMemModelProcess* aProcess, TLinAddr aStartAddress, TUint aSize);
+	void DonatePages(TUint aCount, TPhysAddr* aPages);
+	TInt ReclaimPages(TUint aCount, TPhysAddr* aPages);
+	};
+\end{minted}
+\caption{Demand-paging policy and pager control surface. Files:
+\texttt{demand\_paging.h} and \texttt{flexible/mmu/mpager.h}.}
+\label{lst:mem-demand-paging}
+\end{listing}
+
+\paragraph{Physical RAM and Kernel Allocation}
+
+Below the pager, physical memory is zone-aware. Listing~\ref{lst:mem-ram-heap}
+shows the zone-counting path validating alignment, uniqueness, and full
+coverage of allocatable RAM before the zones can be used. Kernel
+dynamic allocation is handled separately by \texttt{RHeapK}, which serializes
+access with a mutex and leaves compression disabled. That split keeps page
+ownership and heap allocation distinct instead of conflating them.
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+void DRamAllocator::CountZones(const SRamZone* aZones)
+	{
+	TUint32 totalSize = 0;
+	const SRamZone* pCurZ = aZones;
+	for (; pCurZ->iSize != 0; pCurZ++)
+		{
+		TUint32 curEnd = pCurZ->iBase + pCurZ->iSize - 1;
+		/* alignment and overlap checks omitted */
+		if (curEnd <= pCurZ->iBase)
+			{
+			Panic(EZonesAlignment);
+			}
+		if (pCurZ->iId == KRamZoneInvalidId)
+			{
+			Panic(EZonesIDInvalid);
+			}
+		iNumZones++;
+		totalSize += pCurZ->iSize;
+		}
+	if (totalSize>>KPageShift < iTotalRamPages)
+		{
+		Panic(EZonesIncomplete);
+		}
+	}
+
+RHeapK::RHeapK(TInt aInitialSize)
+	: RHybridHeap(aInitialSize, 0, EFalse)
+	{
+	}
+
+TInt RHeapK::Compress()
+	{
+	return 0;
+	}
+
+TInt RHeapK::CreateMutex()
+	{
+	DMutex*& m = *(DMutex**)&iLock;
+	return K::MutexCreate(m, KLitKernHeap, NULL, EFalse, KMutexOrdKernelHeap);
+	}
+\end{minted}
+\caption{Zone-aware RAM setup and the kernel heap path. Files:
+\texttt{ramalloc.cpp} and \texttt{kheap.cpp}.}
+\label{lst:mem-ram-heap}
+\end{listing}
+
+\paragraph{Protection and Paging Exceptions}
+
+Paging faults are isolated from ordinary execution with a dedicated trap type.
+Listing~\ref{lst:mem-paging-trap} shows that pageable operations can be wrapped
+in \texttt{XTRAP\_PAGING}, which installs a \texttt{TPagingExcTrap} before the
+memory access and removes it afterward. That gives the kernel a separate
+control path for recoverable paging exceptions instead of treating every fault
+as a fatal access violation.
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+class TPagingExcTrap
+	{
+public:
+	TInt Trap();
+	inline void UnTrap();
+	void Exception(TInt aResult);
+public:
+	TUint32 iState[EXC_TRAP_CTX_SZ];
+	DThread* iThread;
+	};
+
+#define XTRAP_PAGING(_r,_s)	{								\
+							TPagingExcTrap __t;				\
+							if (((_r)=__t.Trap())==0)		\
+								{							\
+								_s;							\
+								__t.UnTrap();				\
+								}							\
+							}
+\end{minted}
+\caption{Paging-exception trapping for pageable kernel accesses. File:
+\texttt{kern\_priv.h}.}
+\label{lst:mem-paging-trap}
+\end{listing}
+
+\paragraph{Defragmentation and Memory Pressure}
+
+Symbian does not leave fragmentation and pressure to passive allocator luck.
+Listing~\ref{lst:mem-defrag-thrash} shows two active control paths. The
+defragmenter is initialized on its own deferred function call (DFC) queue and
+can walk a zone, moving movable pages elsewhere to recover better physical
+contiguity. Separately, \texttt{DThrashMonitor} measures whether paging itself
+is becoming pathological. Together with the pager interface in
+Listing~\ref{lst:mem-demand-paging}, this shows that memory pressure is managed
+as an ongoing kernel policy problem, not just a one-shot allocation failure.
+
+\begin{listing}[H]
+\begin{minted}{cpp}
+void Defrag::Init3(DRamAllocator* aRamAllocator)
+	{
+	TheDefrag = this;
+
+	TInt r = Kern::DfcQInit(&iTaskQ, KDefragIdlingThreadPriority,
+		&KDefragDfcThreadName);
+	if (r!=KErrNone)
+		Panic(EDfcQInitFailed);
+
+	iRamAllocator = aRamAllocator;
+	}
+
+TInt Defrag::ClearMovableFromZone(SZone& aZone, TBool aBestEffort,
+	TRamDefragRequest* aRequest)
+	{
+	TPhysAddr newAddr;
+	const TUint moveDisFlags = (aBestEffort)
+		? 0
+		: M::EMoveDisBlockRest | M::EMoveDisMoveDirty;
+	TUint offset = 0;
+	TInt ret = iRamAllocator->NextAllocatedPage(&aZone, offset, EPageMovable);
+	while (ret == KErrNone)
+		{
+		if (aRequest->PollForCancel())
+			{
+			return KErrCancel;
+			}
+		/* move one movable page out of the zone */
+		TPhysAddr addr = (offset << M::PageShift()) + aZone.iPhysBase;
+		TInt moved = M::MovePage(addr, newAddr, aZone.iId, moveDisFlags);
+		if (moved != KErrNone && !aBestEffort)
+			{
+			return moved;
+			}
+		offset++;
+		ret = iRamAllocator->NextAllocatedPage(&aZone, offset, EPageMovable);
+		}
+	return KErrNone;
+	}
+
+class DThrashMonitor
+	{
+public:
+	DThrashMonitor();
+	void Start();
+	TInt ThrashLevel();
+	TInt SetThresholds(TUint thrashing, TUint good);
+	void NotifyStartPaging();
+	void NotifyEndPaging();
+	};
+\end{minted}
+\caption{Active defragmentation and thrash monitoring. Files:
+\texttt{defragbase.cpp} and \texttt{flexible/mmu/mthrash.h}.}
+\label{lst:mem-defrag-thrash}
+\end{listing}
