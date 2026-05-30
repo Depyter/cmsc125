@@ -1,3 +1,136 @@
 \subsubsection{BlackBerry OS}
 
-\emph{To be written.}
+\paragraph{Resources Managed}
+
+BlackBerry~10 manages the CPU, memory, I/O devices, and files. A
+distinctive design point is that device drivers and file systems are
+themselves ``resource managers''---user-space processes that present
+devices and files through the unified pathname space
+\citep{qnx_memman, qnx_powersafe_fs}. Resources fall into the usual
+categories: \emph{sharable} (e.g. read-only code, the CPU over time)
+versus \emph{non-sharable} (e.g. a device being written), and
+\emph{preemptable} (CPU, memory) versus \emph{non-preemptable} (a
+partially completed device transaction). In a real-time phone, CPU
+time and responsiveness are the most critical resources, which is why
+so much of QNX's resource machinery is about guaranteeing CPU shares
+\citep{qnx_aps}.
+
+\paragraph{Resource Allocation Strategies}
+
+Allocation is dynamic and priority-driven by default---the
+highest-priority \textsc{ready} thread gets the CPU, memory is
+allocated on demand, and resource managers serve clients in priority
+order \citep{qnx_kernel_sysarch, qnx_memman}. Layered on top is an optional
+adaptive partitioning scheduler (APS), which lets the designer reserve
+a guaranteed minimum percentage of CPU (a budget) for a group of
+threads/processes \citep{qnx_aps}. APS is a configurable QNX
+feature---widely used in domains such as automotive---rather than a
+confirmed default of BlackBerry~10; the discussion below therefore
+describes a capability the platform provides and a BlackBerry~10 build
+could enable, not a documented handset setting. Critically, partitions
+are \emph{adaptive}: when the system is under-loaded, a partition can
+borrow idle CPU beyond its budget; only when the system is overloaded
+are the guaranteed minimums strictly enforced
+\citep{qnx_aps}. This combines high utilisation (no CPU
+wasted) with hard guarantees (important work always gets its share).
+
+\paragraph{Resource Tracking}
+
+The kernel tracks thread/process state and CPU consumption; when
+enabled, APS keeps sliding-window accounting of each partition's CPU
+usage (window 8--400\,ms, plus longer statistics windows viewable via
+the \texttt{aps} command) to enforce budgets
+\citep{qnx_aps, qnx_aps_cpu_percent}. Memory is tracked through the
+process manager's page tables, and resources are reclaimed
+automatically when a process terminates---its address space,
+descriptors, and connections are released \citep{qnx_memman}. A neat
+consequence of Send/Receive/Reply is that when a resource manager
+(driver/file system) does work on behalf of a client, the CPU time
+would---under APS---be \emph{billed to the client's partition}, so
+tracking reflects who actually caused the load \citep{qnx_aps}. Tracking adds modest
+overhead, kept bounded by the windowed averaging scheme
+\citep{qnx_aps_cpu_percent}.
+
+\paragraph{Load Balancing and Distribution}
+
+On multicore hardware, BlackBerry~10 distributes threads across cores
+under symmetric multiprocessing (SMP), with processor-affinity controls
+that let the designer bind threads to specific cores to balance cache
+locality against spreading load \citep{qnx_smp_multicore}. Where APS
+is deployed, it adds \emph{temporal} load balancing---distributing CPU
+time fairly across partitions over its averaging window so that no
+function is starved while another hogs the processor \citep{qnx_aps}. The performance
+implication is high, controlled utilisation; the risk it manages is
+exactly the ``some resources overused while others idle'' problem the
+guide raises.
+
+\paragraph{Handling Deadlock}
+
+QNX's primary stance is avoidance/prevention by design rather than a
+Banker's-algorithm detector. The synchronous Send/Receive/Reply model
+imposes a disciplined, predictable communication ordering that reduces
+the conditions for deadlock \citep{qnx_ipc}. Priority inheritance on
+mutexes and messages prevents priority inversion (a deadlock-adjacent
+hazard) by temporarily boosting a blocking holder's priority
+\citep{qnx_kernel_sysarch, qnx_ipc}. For situations that still go
+wrong---including a hung or deadlocked server---QNX's architecture
+allows the offending process to be restarted without taking down the
+system, and its optional HA Framework provides a watchdog (the HAM)
+that can detect unresponsive processes and restart them as a
+system-level backstop where deployed \citep{qnx_ham}. The trade-off: QNX does not centrally prevent
+all deadlocks algorithmically (that burden sits partly with the
+application designer), but its architecture makes deadlock both less
+likely and recoverable.
+
+\paragraph{Resource Contention and Resolution}
+
+When processes compete for a resource, requests are served in priority
+order, and a mutex is handed to the highest-priority waiting thread on
+release, so threads pass through a critical region in priority order
+\citep{qnx_kernel_sysarch}. Priority inheritance keeps a high-priority
+requester from being blocked indefinitely behind a low-priority holder
+\citep{qnx_ipc}. Under high contention, an APS-enabled QNX configuration guarantees
+each partition its floor so contention cannot completely lock out
+important work \citep{qnx_aps}. Fairness is thus \emph{priority-weighted} rather than
+egalitarian---appropriate for a real-time system.
+
+\paragraph{Performance and Efficiency}
+
+Resource management adds overhead in two places: message-passing and
+context-switch cost for every resource-manager interaction
+\citep{qnx_arm_memory}, and the windowed accounting of APS
+\citep{qnx_aps_cpu_percent}. QNX balances efficiency against fairness
+by letting partitions borrow idle time (efficiency) while enforcing
+minimum budgets only under load (fairness), and balances performance
+against complexity by making partitioning \emph{optional}---designers
+pay for it only when they need the guarantees \citep{qnx_aps}.
+
+\paragraph{Scalability}
+
+BlackBerry~10 scales with added processes/users bounded mainly by
+physical resources, and scales across cores via SMP with processor
+affinity \citep{qnx_smp_multicore}. APS, where deployed, scales to many
+partitions and has been used in complex systems (e.g. automotive) where
+dozens of subsystems share a chip \citep{qnx_aps}. As
+load rises, the limits that appear are message-passing overhead and
+the per-process memory cost of private address spaces
+\citep{qnx_memman, qnx_arm_memory}---the price of the isolation that
+makes the system robust.
+
+\paragraph{Overview --- Resource Management}
+
+Strengths include dynamic priority allocation, optional
+\emph{guaranteed} CPU budgets via adaptive partitioning where enabled,
+automatic reclamation, accurate client-billed accounting, and
+architectural restartability (optionally managed by the HA Framework's
+HAM) \citep{qnx_memman, qnx_ham, qnx_aps}. Weaknesses are
+message-passing/accounting overhead and reliance on the designer to
+structure partitions and avoid application-level deadlock
+\citep{qnx_aps, qnx_arm_memory}. Under heavy load, a QNX system using
+APS behaves predictably: low-priority/untrusted partitions are
+throttled to their minimums so critical work keeps running, whereas a
+purely priority-based competitor could let high-priority work starve
+everything else \citep{qnx_aps}. In a resource-constrained system,
+QNX's small footprint (an HMI can run in 32\,MB or less) and explicit
+budgeting make it well suited, often better than a heavier
+general-purpose OS \citep{slideshare_rim_qnx}.

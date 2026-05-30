@@ -1,3 +1,139 @@
 \subsubsection{BlackBerry OS}
 
-\emph{To be written.}
+\paragraph{Concurrency Model and Support}
+
+BlackBerry~10 fully supports concurrent execution of multiple
+processes and threads. The model is multi-process and multi-threaded:
+each process is MMU-isolated and contains one or more kernel-scheduled
+threads sharing the process address space \citep{qnx_kernel_sysarch}. Apparent
+simultaneity on a single core comes from the preemptive priority
+scheduler rapidly switching threads; on multiple cores it is genuine
+parallelism via SMP \citep{qnx_kernel_sysarch, qnx_ham}. The scheduler
+is therefore the engine of concurrency, while message passing is the
+engine of co-ordination between isolated processes.
+
+\paragraph{Process Synchronization}
+
+BlackBerry~10 provides the full set of POSIX synchronization
+primitives, usable even between threads in different processes:
+mutexes, semaphores, condition variables, spinlocks, barriers,
+reader/writer locks, and atomic operations (\texttt{<atomic.h>}) for
+short uninterruptible updates \citep{qnx_kernel_sysarch}. A mutex guarantees exclusive
+access to shared data; only one thread holds it, and on release the
+highest-priority waiter acquires it, so threads traverse a critical
+region in priority order \citep{qnx_kernel_sysarch}. The advantage of
+this rich toolbox is the right tool for each job; the disadvantage is
+that locks introduce blocking, and misuse risks contention or
+inversion---which QNX counters with priority inheritance that
+temporarily boosts a lock holder's priority to prevent inversion
+\citep{qnx_kernel_sysarch, qnx_kernel_sync}.
+
+\paragraph{Inter-Process Communication}
+
+The cornerstone of BlackBerry~10's design is synchronous message
+passing---Send/Receive/Reply \citep{qnx_ipc}. A client sends a request and
+blocks; a server receives messages (in priority order), processes
+them, and replies, unblocking the client \citep{qnx_ipc}. The very act
+of message passing provides natural synchronization between client and
+server, so it frequently removes the need for separate locks
+\citep{qnx_ipc, qnx_kernel_sync}. Messages are directed to channels
+and connections rather than thread-to-thread, and the system also
+offers pulses---fixed-size, non-blocking messages (four bytes plus a
+one-byte code) for asynchronous notification \citep{qnx_ipc}. Shared
+memory is supported for bulk data: a message can carry a reference to
+a shared region so the server reads/writes it directly instead of
+copying \citep{qnx_ipc_shmem}. POSIX signals, pipes, and sockets round
+out the options. The trade-offs are real: synchronous messaging is
+simple, testable, and self-synchronising but couples sender and
+receiver in time; shared memory is fastest for large data but needs
+explicit synchronization; pulses are cheap and non-blocking but carry
+little payload \citep{qnx_ipc, qnx_ipc_shmem}. Message passing is also
+the only IPC that works transparently across a network of QNX nodes
+\citep{qnx_kernel_sync}.
+
+\paragraph{Handling Critical Sections and Race Conditions}
+
+Critical sections are protected with mutexes/semaphores or, more
+idiomatically, by routing shared-state access through a single server
+thread so that the synchronous Send/Receive/Reply discipline serialises
+access automatically \citep{qnx_ipc, qnx_kernel_sysarch}. Atomic
+operations cover trivial cases (e.g. incrementing a counter) without a
+lock \citep{qnx_kernel_sysarch}. The architecture's deeper defence
+against races is memory isolation---processes cannot accidentally touch
+each other's data at all, so the only shared state is what is
+\emph{deliberately} shared and therefore deliberately guarded
+\citep{qnx_memman}. If a race is mishandled and a thread corrupts
+memory it shouldn't, the MMU traps it and the thread is aborted rather
+than silently producing wrong results \citep{qnx_memman}.
+
+\paragraph{Deadlock, Starvation, Livelock (revisited)}
+
+Deadlock conditions (mutual exclusion, hold-and-wait, no preemption,
+circular wait) can arise in any system that uses blocking locks, and
+QNX is no exception at the application level. QNX's mitigations are:
+the disciplined Send/Receive/Reply ordering that discourages circular
+waits \citep{qnx_ipc}; priority inheritance to prevent the inversion
+that aggravates deadlock/starvation \citep{qnx_kernel_sysarch,
+qnx_ipc}; optional adaptive partitioning to prevent starvation by guaranteeing
+CPU floors when enabled \citep{qnx_aps}; and, where the HA Framework is
+deployed, the HAM to detect and recover hung processes when prevention
+fails \citep{qnx_ham}. The limitation is
+that QNX does not run a global deadlock-detection algorithm---
+correctness still depends partly on disciplined application design.
+
+\paragraph{Locking Strategies}
+
+BlackBerry~10 supports both fine-grained and coarse-grained locking;
+the choice is the developer's. Coarse locks are simple and have low locking
+overhead but serialise more and scale poorly on many cores;
+fine-grained locks improve parallelism and scalability but add
+complexity and per-lock overhead and raise deadlock risk. The
+microkernel minimises \emph{system-level} lock contention by handling
+much OS state through message passing rather than big shared kernel
+locks \citep{qnx_kernel_sysarch, qnx_ipc}, and priority-ordered mutex
+hand-off keeps waiting predictable \citep{qnx_kernel_sysarch}.
+
+\paragraph{Performance and Overhead}
+
+The cost of synchronization shows up as blocking, context switching,
+and (for spinlocks) busy-waiting \citep{qnx_kernel_sysarch}. QNX
+balances correctness against performance by making the \emph{common}
+path---message passing---both the synchronization mechanism and the
+communication mechanism, so one round trip does both jobs and ``can
+render other synchronization services unnecessary''
+\citep{qnx_kernel_sync}. This keeps the system efficient while
+preserving correctness, at the cost of the context-switch overhead
+inherent to a microkernel \citep{qnx_arm_memory}.
+
+\paragraph{Scalability and Multicore Considerations}
+
+BlackBerry~10 handles concurrency on multicore systems via SMP, and
+performance improves as cores are added for parallelisable workloads
+\citep{qnx_smp_multicore}; later QNX releases add BMP, giving affinity
+control to preserve cache locality \citep{qnx_neutrino_overview}.
+The challenges of greater parallelism---lock contention,
+cache-coherency traffic, and cross-core message costs---are addressed
+by fine-grained locking where needed, affinity binding, and ARM
+cache/TLB strategies that avoid full flushes on context switch
+\citep{qnx_ham, qnx_arm_memory}. The
+microkernel's avoidance of monolithic kernel-wide locks is itself a
+scalability advantage.
+
+\paragraph{Overview --- Concurrency Management}
+
+Strengths include self-synchronising message passing that doubles as
+IPC and sync, a full POSIX primitive set, priority-inheritance
+correctness guarantees, memory isolation that eliminates accidental
+sharing, and good multicore scaling (with BMP affinity in later
+releases) \citep{qnx_kernel_sysarch, qnx_ipc, qnx_smp_multicore,
+qnx_neutrino_overview}. Weaknesses are that
+synchronous messaging couples timing, there is no global deadlock
+detector, and the microkernel imposes context-switch overhead
+\citep{qnx_arm_memory}. For many threads sharing data, QNX encourages
+funnelling access through a server process whose Send/Receive/Reply
+discipline serialises it safely, or guarding it with priority-ordered
+mutexes \citep{qnx_kernel_sysarch, qnx_ipc}. For a high-performance
+web server or database, QNX delivers correctness and predictable
+latency and scales across cores, though a competitor tuned purely for
+shared-memory throughput may achieve higher raw transaction rates
+where hard real-time guarantees aren't required.

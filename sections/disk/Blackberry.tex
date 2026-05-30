@@ -1,3 +1,132 @@
 \subsubsection{BlackBerry OS}
 
-\emph{To be written.}
+\paragraph{File System Structure and Organization}
+
+BlackBerry~10/QNX's flagship file system is the Power-Safe file system
+(\texttt{fs-qnx6}), a reliable on-disk file system explicitly designed
+to survive power failures without losing or corrupting data
+\citep{qnx_powersafe_fs}. BlackBerry~10 is also POSIX-based, so it provides transparent access to
+other file systems, including DOS/FAT and Linux ext2
+\citep{qnx_neutrino_overview, qnx_fs_fault_tolerance}. Power-Safe is inode-based like traditional UNIX file
+systems and is created with \texttt{mkqnx6fs}, which lets you set
+logical block size, endianness, block count, and the maximum number of
+inodes (hence files) \citep{qnx_powersafe_fs}. Its defining structural
+property is copy-on-write (COW): modified blocks are relocated rather
+than overwritten in place \citep{qnx_fs_fault_tolerance}. The advantage
+is integrity; the limitation is the write amplification and bookkeeping
+COW entails.
+
+\paragraph{File Access Methods and Operations}
+
+Basic operations (\texttt{open}, \texttt{read}, \texttt{write},
+\texttt{close}) follow the POSIX model, but the mechanism is pure
+microkernel: a file operation is a message to a resource-manager
+process (the file system running in user space), not a kernel call
+\citep{qnx_memman, qnx_powersafe_fs}. The OS supports sequential and
+random access, and processes hold file descriptors that map to
+connections to the file-system resource manager. Internally, when a
+file is accessed the request is sent to \texttt{fs-qnx6}, which
+consults its cached metadata and buffer cache, performs the read/write
+against relocated COW blocks, and replies---the same Send/Receive/Reply
+pattern that governs all QNX IPC \citep{qnx_ipc, qnx_powersafe_fs}.
+
+\paragraph{Directory Structures}
+
+BlackBerry~10 uses a hierarchical, tree-structured namespace rooted at
+\texttt{/}, with \texttt{/} (0x2F) as the path separator
+\citep{qnx_powersafe_fs}.
+Directories are implemented as special files containing name-to-inode
+entries; path resolution walks the tree component by component, and
+because the namespace is unified, a path may even resolve across the
+network to another node transparently \citep{qnx_ipc, qnx_powersafe_fs}.
+The performance implication is that deep paths cost more lookups,
+mitigated by metadata caching in the file-system process.
+
+\paragraph{Disk Space Allocation and Free Space Management}
+
+Power-Safe uses indexed (inode/extent-style) allocation and tracks free
+space with on-disk structures updated through COW. Crucially, space is
+allocated by relocating modified blocks to free space and only then
+committing a new superblock/root that references them, so at any
+instant either the complete old version or the complete new version is
+valid---never a half-written mix \citep{qnx_fs_fault_tolerance}. File
+growth and shrinking are handled by allocating/relocating blocks;
+Power-Safe also creates sparse files by default when a file is grown
+with \texttt{ftruncate()} \citep{qnx_powersafe_fs}. The trade-off
+versus simple in-place allocation is extra space and write activity in
+exchange for crash safety.
+
+\paragraph{File Protection and Security}
+
+BlackBerry~10 enforces POSIX/UNIX-style permissions (owner/group/other
+read--write--execute) plus user and group ownership, backed by the
+user/kernel-mode and MMU isolation already described
+\citep{qnx_memman, qnx_neutrino_overview}. The Power-Safe file system
+additionally offers encryption of all or part of the file system
+\citep{qnx_powersafe_fs}. These mechanisms give a familiar,
+well-understood security model; their limitation is that classic UNIX
+permissions are coarser than full access-control lists (ACLs), though
+they are simple and fast.
+
+\paragraph{Reliability and Crash Recovery}
+
+This is QNX's standout file-system strength. Rather than journaling,
+Power-Safe uses copy-on-write plus periodic snapshots: a snapshot
+captures a consistent view of the whole file system, taken
+automatically (every 10 seconds by default), and also on
+\texttt{sync()} or \texttt{fsync()}
+\citep{qnx_powersafe_fs, qnx_fs_fault_tolerance}. If power is lost
+mid-write, the half-written new blocks are simply never committed, and
+the system falls back to the last consistent snapshot---``at any point
+in time either the old version is completely accessible or the new
+version is completely accessible,'' with no live data overwritten in
+between \citep{qnx_fs_fault_tolerance}. This specifically defends
+against the corrupted ECC sectors that ordinary file systems can
+suffer on power loss \citep{qnx_powersafe_fs}. The trade-off:
+durability is bounded by snapshot frequency (work since the last
+snapshot can be lost), and synchronous guarantees require drives that
+honour cache-flush/synchronisation commands
+\citep{qnx_fs_fault_tolerance}.
+
+\paragraph{Disk Scheduling and I/O Management}
+
+Disk I/O is mediated by the block I/O driver stack (\texttt{devb-*})
+and the file-system resource manager, which queue and order requests
+to the underlying device \citep{qnx_powersafe_fs}. Buffering and a
+configurable buffer cache sit between applications and the disk, and
+snapshot/commit timing governs when dirty blocks are flushed
+\citep{qnx_powersafe_fs, qnx_powersafe_perf}. Because QNX is real-time
+oriented, its I/O path emphasises predictable latency and integrity
+over squeezing out maximum raw throughput.
+
+\paragraph{Performance Considerations}
+
+Performance ``depends on how much buffer cache is available, and on
+the frequency of the snapshots'' \citep{qnx_powersafe_perf}. More cache
+and less frequent snapshots raise throughput but widen the window of
+potential data loss and the cost of an eventual sync; conversely,
+frequent snapshots maximise safety at a throughput cost---and because
+synchronisation is at the \emph{file-system} level, \texttt{fsync()} is
+potentially expensive and \texttt{O\_SYNC} is ignored
+\citep{qnx_powersafe_perf}. Read-ahead and buffering help large
+sequential files; many small files stress metadata and inode handling.
+The headline trade-off is that crash safety (COW + snapshots) costs
+some write performance.
+
+\paragraph{Overview --- File and Disk Management}
+
+Strengths include outstanding crash/power-failure resilience via COW
+and snapshots, integrity by design, POSIX semantics, multi-file-system
+interoperability (ext2/FAT/exFAT), and optional encryption
+\citep{qnx_powersafe_fs, qnx_neutrino_overview, qnx_fs_fault_tolerance}.
+Weaknesses are COW write amplification and snapshot-bounded durability;
+a coarse permission model relative to full ACLs; and tuning for
+reliability over peak speed
+\citep{qnx_fs_fault_tolerance, qnx_powersafe_perf}. For a logging
+system doing frequent writes, Power-Safe protects integrity but the
+constant block relocation and periodic full-filesystem sync impose
+overhead---a designer would tune snapshot frequency and cache to
+balance safety against write rate \citep{qnx_powersafe_perf}. For large
+multimedia files, sequential read-ahead and buffering serve well,
+though a throughput-optimised competitor might edge ahead on pure
+streaming speed where crash safety is less critical.

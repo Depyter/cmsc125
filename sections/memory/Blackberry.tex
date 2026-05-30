@@ -1,3 +1,119 @@
 \subsubsection{BlackBerry OS}
 
-\emph{To be written.}
+\paragraph{Address Translation and Memory Model}
+
+BlackBerry~10 uses paging through the CPU's MMU. Physical memory is
+divided into pages (typically 4\,KB), and hardware page tables map each
+process's virtual addresses to physical addresses; the process manager
+owns and updates these tables as it starts and switches processes
+\citep{qnx_memman}. The translation look-aside buffer (TLB) caches
+recent translations. QNX also supports variable page sizes where the
+processor allows: a larger page reduces the number of TLB entries
+needed, cutting TLB misses and improving memory-access speed---at the
+cost of coarser allocation granularity \citep{qnx_memman}. On older ARM cores, QNX
+used the FCSE slot scheme to avoid cache flushes across context
+switches \citep{qnx_arm_memory}; on the ARMv7 cores in BlackBerry~10,
+this role is filled by ASID-tagged TLB entries instead. The structures involved are
+therefore page tables, the TLB, and per-process mappings.
+
+\paragraph{Virtual Memory Management and Implementation}
+
+BlackBerry~10 implements on-demand paging: when memory is mapped (for
+example via \texttt{mmap()}), physical pages are generally \emph{not}
+allocated immediately. Instead the mapping records what should back the range;
+the first read or write to a page triggers a page fault, on which the
+memory manager allocates a physical page, initialises its contents,
+and installs the page-table entry \citep{membarrier_qnx8_mem}. The
+performance implication is lower up-front memory use and faster
+mapping, paid for by a one-time fault cost on first touch.
+
+\paragraph{Memory Allocation Strategies}
+
+Each process receives its own large private virtual address space (up
+to 2--3.5\,GB depending on CPU) \citep{qnx_memman}. Within it, the
+loader lays out the text, data, BSS, stack, and shared libraries;
+\texttt{malloc()} then finds free virtual ranges for the heap
+\citep{qnx_arm_memory}. The OS balances efficient allocation against
+speed by allocating lazily (on demand) and by supporting POSIX memory
+locking (\texttt{mlock}) so a latency-sensitive process can pin pages
+resident and avoid fault latency entirely \citep{qnx_memman}---a direct
+speed-versus-memory trade the designer controls.
+
+\paragraph{Page Replacement Policies}
+
+Page replacement matters when the system pages to backing store under
+memory pressure. QNX's modern memory manager is built around on-demand
+paging with a working-set discipline, choosing which pages to retain
+based on usage \citep{membarrier_qnx8_mem}. As an embedded/real-time
+OS, QNX is typically configured to \emph{minimise} dependence on
+swapping, because the unbounded latency of fetching a page from slow
+storage is hostile to real-time guarantees---hence the prominence of
+memory locking to keep critical pages resident \citep{qnx_memman}. The
+trade-off is accuracy (keeping the truly hot pages) versus the overhead
+of tracking page usage.
+
+\paragraph{Memory Protection}
+
+Protection is enforced by the MMU plus user/kernel-mode separation.
+Each process is isolated; page permissions govern read/write/execute
+access \citep{qnx_memman}. When a process attempts an illegal access---
+touching unmapped memory or violating page permissions---the MMU
+notifies the OS, which aborts the offending thread at the faulting
+instruction, containing the fault rather than letting it corrupt other
+processes or the kernel \citep{qnx_memman}. This is the foundation of
+the OS's robustness: faults are local and recoverable, which is what
+allows the HAM to restart a crashed component \citep{qnx_ham}.
+
+\paragraph{Fragmentation}
+
+Paging itself largely eliminates \emph{external} fragmentation, since
+any free physical page can back any virtual page---memory contiguous in
+the program may be split across physical memory transparently
+\citep{qnx_memman}. \emph{Internal} fragmentation (partly used pages)
+is the residual cost, and variable page sizes are a tuning knob here
+\citep{qnx_memman}. QNX also performs physical-memory defragmentation in
+its memory manager rather than relying on stop-the-world compaction,
+consistent with a real-time design that avoids long uninterruptible
+operations \citep{qnx_memman}.
+
+\paragraph{Behaviour Under Pressure}
+
+Under low memory, an on-demand-paging system either reclaims/pages out
+cold pages or, in a configuration without swap, fails allocations and
+may terminate processes. Because real-time correctness forbids
+unbounded paging latency, QNX leans toward keeping the working set
+resident (memory locking) and, where the optional adaptive partitioning
+scheduler is enabled, bounding usage with partitioning rather than
+thrashing on a swap device \citep{qnx_memman, qnx_aps}. Thrashing
+is best avoided in QNX by design (locking critical memory, budgeting
+resources) rather than detected after the fact. This makes its
+behaviour under pressure predictable, if less elastic than a desktop OS
+that swaps aggressively.
+
+\paragraph{Performance Considerations}
+
+Page size, TLB efficiency, and page-fault rate are the levers. Larger
+variable pages reduce TLB misses and speed access but coarsen
+allocation \citep{qnx_memman}; on-demand paging trims memory at the
+cost of first-touch faults \citep{membarrier_qnx8_mem}; memory locking
+removes fault latency at the cost of holding physical RAM
+\citep{qnx_memman}. The design choices that improve performance
+(locking, larger pages) tend to increase memory usage, and vice
+versa---a trade BlackBerry/QNX exposes to the system designer rather
+than hiding.
+
+\paragraph{Overview --- Memory Management}
+
+Strengths include strong per-process isolation, predictable (lockable)
+memory behaviour suited to real-time use, low external fragmentation,
+and tunable page sizes \citep{qnx_memman, membarrier_qnx8_mem}.
+Weaknesses are that private address spaces add per-process page-table
+cost ($\approx$\,4--8\,KB each) and make cross-space operations
+costlier than in a shared-space design \citep{qnx_memman}; the
+real-time bias toward locking trades elasticity for predictability. On
+a system with several apps and limited RAM, BlackBerry~10 keeps each
+app protected and behaves predictably, but a desktop-class OS with
+aggressive swapping might keep \emph{more} apps nominally alive under
+heavy overcommit. For memory-intensive apps (browsers, games), its MMU
+isolation and demand paging serve them well, while a designer can lock
+the latency-critical portions resident \citep{qnx_memman}.
