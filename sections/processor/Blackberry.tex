@@ -1,3 +1,132 @@
 \subsubsection{BlackBerry OS}
 
-\emph{To be written.}
+\paragraph{Scheduling Policy and Goals}
+
+BlackBerry~10, through QNX Neutrino, uses priority-based, preemptive
+scheduling. Every thread has a priority, and the rule is absolute: if a
+higher-priority thread becomes \textsc{ready}, it immediately preempts
+all lower-priority threads
+\citep{qnx_kernel_sysarch, qnx_sched_policies}. The scheduler's
+primary goal is real-time responsiveness and determinism---guaranteeing
+that the most important work runs predictably---rather than the
+``fairness for everyone'' goal of a general-purpose desktop scheduler.
+Priority is the explicit measure (256 levels), and among threads of
+equal priority a secondary policy decides order \citep{qnx_kernel_sysarch}.
+
+\paragraph{Scheduling Schemes}
+
+The scheduler picks the highest-priority \textsc{ready} thread. Among
+threads sharing the same priority, three policies are available
+\emph{per thread} \citep{qnx_kernel_sysarch, qnx_sched_policies}:
+
+\begin{itemize}
+\item \textbf{FIFO (SCHED\_FIFO):} the chosen thread runs until it
+  blocks or is preempted by a higher-priority thread---it is \emph{not}
+  time-sliced against equal-priority peers.
+\item \textbf{Round-robin (SCHED\_RR):} identical to FIFO except the
+  thread also yields after consuming a timeslice ($4\times$ the clock
+  tick; with a CPU faster than 40\,MHz the tick defaults to 1\,ms),
+  then goes to the back of its priority queue \citep{qnx_sched_policies}.
+\item \textbf{Sporadic (SCHED\_SPORADIC):} gives a thread an execution
+  budget within a period, letting its priority oscillate between a
+  normal and a low level---designed for Rate Monotonic Analysis of
+  mixed periodic/aperiodic real-time work \citep{qnx_kernel_sysarch,
+  qnx_sched_policies}.
+\end{itemize}
+
+The core data structure is the ready queue, implemented as 256 separate
+queues, one per priority level; threads within a queue are normally
+ordered FIFO \citep{qnx_kernel_sysarch}. Notably, a server thread
+emerging from a \textsc{receive}-blocked state with a client message is
+inserted at the \emph{head} of its queue---LIFO---to keep latency low
+\citep{qnx_kernel_sysarch}. CPU time is thus allocated either by
+blocking (FIFO) or by fixed timeslice (round-robin), and scheduling is
+preemptive \citep{qnx_kernel_sysarch, qnx_sched_policies}.
+
+\paragraph{Context Switching}
+
+Context switching is frequent in BlackBerry~10 precisely because so much
+OS work happens through message passing between user-space processes---every
+Send/Receive/Reply and every interrupt delivery to a driver crosses an
+address-space boundary \citep{qnx_arm_memory}. The cost of switching
+between two fully private address spaces is higher than switching within
+one address space. Older ARM cores reduced this with the FCSE
+\citep{qnx_arm_memory}; on the ARMv7-class hardware in BlackBerry~10,
+that mechanism is superseded by ASID-tagged TLBs, which serve the same
+purpose of avoiding a flush on every switch. The trade-off is the
+defining one for the OS: more switching buys responsiveness and
+isolation; the overhead is managed by keeping the kernel path short and
+the switch cheap.
+
+\paragraph{Process and Thread Handling}
+
+BlackBerry~10 supports the full POSIX model: processes are MMU-protected
+from one another, and each process contains one or more threads that
+share the process's address space \citep{qnx_kernel_sysarch}. Threads are
+kernel-level---the kernel schedules threads directly and individually,
+not whole processes, so a multithreaded program genuinely exploits the
+scheduler. A thread inherits its scheduling policy from its parent
+process but may change it at runtime \citep{qnx_kernel_sysarch,
+qnx_sched_policies}. The advantage is true parallelism with fine-grained
+scheduling control; the disadvantage is that kernel-level threading
+makes every thread operation a (cheap, but real) kernel interaction.
+
+\paragraph{Behaviour Under Different Workloads}
+
+For CPU-bound work, equal-priority threads benefit from round-robin
+time-slicing so no one thread starves the others; a single
+high-priority compute thread can monopolise the CPU by design, which is
+correct for real-time control. For I/O-bound and interactive work, the
+strict-priority preemptive model shines: a UI or input thread set at
+high priority immediately preempts background computation, giving
+snappy, predictable response---exactly what a touch phone needs
+\citep{crackberry_qnxhistory}. Long-running batch work is best run at
+lower priority or in its own partition (see below) so it consumes only
+spare cycles. The OS favours responsiveness for user-facing tasks over
+batch throughput.
+
+\paragraph{Multicore and Parallel Processing}
+
+BlackBerry~10 scales across multiple cores and supports SMP (symmetric
+multiprocessing) and AMP (asymmetric multiprocessing)
+\citep{qnx_smp_multicore}; later QNX releases additionally describe a
+QNX-specific refinement called Bound Multiprocessing (BMP), an
+improvement on standard SMP processor affinity that lets the designer
+bind a thread to a specific core to maximise cache locality while still
+allowing the rest of the system to load-balance across cores
+\citep{qnx_neutrino_overview}. The trade-off is the classic one: pinning a thread to one core
+preserves its warm cache (more cache hits) but can leave that core
+overloaded while others idle; pure load balancing keeps cores busy but
+sacrifices cache locality. BMP is QNX's way of giving the designer
+explicit control over that balance per thread \citep{qnx_neutrino_overview}.
+
+\paragraph{Starvation, Fairness, and Priority Handling}
+
+Pure strict-priority scheduling \emph{can} cause starvation: a stream of
+high-priority threads can indefinitely block lower-priority ones. QNX
+mitigates this in two principal ways. First, priority inheritance: when
+a high-priority client sends a message to a lower-priority server, the
+server temporarily inherits the client's priority so it isn't held
+back, which also prevents priority inversion
+\citep{qnx_ipc, qnx_kernel_sysarch}. Second, QNX's optional adaptive partitioning
+scheduler can guarantee each partition a minimum percentage of CPU when
+the system is overloaded, so an ``unimportant or untrusted'' partition
+cannot monopolise the processor and starve others \citep{qnx_aps}.
+Priorities are assigned by the designer and can be adjusted dynamically
+(and automatically, under sporadic scheduling)
+\citep{qnx_sched_policies}.
+
+\paragraph{Overview --- Processor Management}
+
+Strengths include deterministic real-time response, fine per-thread
+control, kernel-level threading, strong multicore support (with BMP
+affinity in later releases), and starvation control via priority
+inheritance and optional adaptive partitioning
+\citep{qnx_kernel_sysarch, qnx_smp_multicore, qnx_neutrino_overview,
+qnx_aps}. Weaknesses
+are that strict priority demands careful design to avoid starvation and
+that heavy message passing makes context switching frequent
+\citep{qnx_arm_memory}. In a system mixing interactive apps with
+background tasks, QNX performs better because it can guarantee the
+interactive partition its CPU share while letting background work
+consume only the surplus \citep{qnx_aps}.

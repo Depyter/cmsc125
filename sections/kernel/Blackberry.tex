@@ -1,3 +1,183 @@
 \subsubsection{BlackBerry OS}
 
-\emph{To be written.}
+\paragraph{Scope Note}
+
+``BlackBerry OS'' refers to two technically distinct generations. The
+\emph{classic} BlackBerry OS (1999--2013) was a closed, proprietary system
+whose third-party layer ran on Java 2 Micro Edition (J2ME), sitting on top
+of an in-house monolithic kernel. Its successor, BlackBerry 10
+(2013--2018), was a complete rewrite built on the QNX Neutrino Real-Time
+Operating System (RTOS)---a true microkernel that BlackBerry (then RIM)
+acquired with QNX Software Systems in 2010
+\citep{crackberry_qnxhistory}. Because the internals of the proprietary classic
+kernel were never publicly documented to the depth these guide questions
+require, while QNX Neutrino is extensively documented, the technical
+analysis below centres on the QNX-based BlackBerry~10 architecture, which
+is the canonical ``BlackBerry OS'' for serious operating-system study.
+The classic era is treated where the guide questions touch history and
+design intent.
+
+\paragraph{Kernel Architecture and Design}
+
+BlackBerry~10's kernel is a microkernel---specifically the QNX Neutrino
+microkernel. This is the single most important architectural fact about
+the OS, because almost every trade-off discussed later flows from it. In
+a microkernel, the kernel itself is kept deliberately tiny: it provides
+only the minimal services (thread scheduling, interprocess communication,
+and low-level interrupt redirection), while everything normally thought
+of as ``the operating system''---file systems, device drivers, network
+stacks, the graphics subsystem---runs \emph{outside} the kernel as
+ordinary user-space processes \citep{bb_microkernel_dev,
+qnx_kernel_sysarch}. The QNX source base is on the order of roughly
+100{,}000 lines for the core, against millions for monolithic kernels,
+which is the structural reason for its reliability claims
+\citep{qnx_memman, crackberry_qnxhistory}.
+
+This is the opposite of a monolithic kernel (the design used by Linux,
+classic Windows, and indeed the \emph{classic} Java-based BlackBerry OS,
+which the same sources describe as a monolithic system)
+\citep{crackberry_qnxhistory}. It is also distinct from a hybrid kernel.
+The key characteristics of the QNX microkernel are: (1) it is never
+itself ``scheduled''---the processor enters kernel code only on an
+explicit kernel call, an exception, or a hardware interrupt
+\citep{qnx_kernel_sysarch}; and (2) the OS is structured ``more like a
+team than a hierarchy,'' a set of co-operating peer processes
+co-ordinated through the kernel, which acts as a software bus into which
+OS modules can be plugged in and out at runtime
+\citep{bb_microkernel_dev}.
+
+Inside the kernel sit thread scheduling, the Send/Receive/Reply
+message-passing primitives, signals, timers, and interrupt redirection.
+The only mandatory companion is the process manager (\texttt{procnto}),
+which handles process creation, memory management, and the pathname
+space \citep{bb_microkernel_dev}. Outside the kernel, in user space,
+live device drivers, the Power-Safe file system, the TCP/IP stack, and
+all applications---each in its own memory-management-unit
+(MMU)-protected address space \citep{bb_microkernel_dev, qnx_powersafe_fs,
+qnx_neutrino_overview}. QNX was engineered from day one for
+mission-critical, real-time embedded use---it runs in cars, medical
+devices, nuclear plant controls, and routers
+\citep{qnx_memman, qnx_ham}. For a phone, RIM wanted that same fault
+containment and responsiveness, plus the ability to run rich,
+multitasking, multimedia applications safely, which the PlayBook tablet
+proved QNX could do \citep{crackberry_qnxhistory}.
+
+\paragraph{Kernel Components and Responsibilities}
+
+The kernel's own responsibilities are intentionally narrow: process and
+thread scheduling, interprocess communication (IPC), and first-line
+interrupt handling \citep{qnx_kernel_sysarch}. Larger responsibilities
+people associate with an OS---memory-protection policy, file management,
+input/output---are delegated. Memory management is owned by the process
+manager bolted onto the microkernel; file and device I/O are owned by
+independent resource-manager processes \citep{qnx_memman}.
+
+Because of this delegation, kernel components are modular rather than
+tightly integrated. A file system or driver is a separate program that
+can be started, stopped, and upgraded on a live system without
+rebuilding or rebooting the kernel
+\citep{qnx_ham, qnx_neutrino_overview}. This dramatically improves
+maintainability---a bug fix to a driver does not require recompiling the
+OS---at a modest performance cost, because requesting a service means a
+message round-trip and context switch instead of a direct in-kernel
+function call.
+
+\paragraph{User Space versus Kernel Space}
+
+BlackBerry~10 fully uses the CPU's MMU to give every process its own
+private virtual address space, delivering the complete POSIX process
+model in protected memory \citep{bb_microkernel_dev, qnx_memman}. Drivers and
+applications ``sit in their own isolated memory address and operate
+independently'' \citep{qnx_memman}. When a process attempts to touch
+memory it was not granted---including kernel memory---the MMU traps the
+access and notifies the OS, which aborts the offending thread at the
+faulting instruction rather than letting the corruption spread
+\citep{qnx_memman}. The payoff is strong stability and security: a rogue
+or buggy component cannot silently corrupt the kernel or its neighbours,
+and ``rogue apps can't steal data they haven't been granted access to''
+\citep{crackberry_qnxhistory}.
+
+\paragraph{Interrupts and Exception Handling}
+
+A hardware interrupt vectors into the microkernel, which performs the
+minimum work and then hands control to an interrupt service routine
+(ISR) that has been attached by a user-space driver. Because drivers
+live outside the kernel, interrupt handling involves a context switch
+into the driver's address space \citep{qnx_arm_memory}. Exceptions---
+illegal memory access, divide-by-zero, and similar fault conditions---
+are caught by the MMU/CPU and reported to the OS, which terminates the
+faulting thread cleanly \citep{qnx_memman}. Keeping the in-kernel
+interrupt path short is what lets QNX maintain low, \emph{deterministic}
+latency, the property that makes it a real-time OS. The counter-pressure
+is that frequent message passing and driver context switches make
+context switching more common than in a monolithic kernel. On older ARM
+cores QNX reduced this cost with the Fast Context Switch Extension
+(FCSE), which avoided cache and translation-look-aside-buffer (TLB)
+flushing on each switch \citep{qnx_arm_memory}; on the ARMv7-class cores
+used by BlackBerry~10, FCSE is obsolete, and the same cost is avoided
+instead by hardware address-space identifier (ASID) tagging of the TLB,
+which lets translations for different processes coexist without a flush.
+
+\paragraph{Modularity and Extensibility}
+
+Yes---emphatically. Individual processes, ``whether applications or OS
+services---including device drivers---can be started and stopped
+dynamically, without jeopardizing system uptime,'' and components such
+as drivers and file-system managers can be dynamically loaded and
+unloaded \citep{qnx_ham, qnx_neutrino_overview}. The OS behaves ``as a
+kind of software bus that lets you dynamically plug in/out OS modules
+whenever they're needed'' \citep{bb_microkernel_dev}. Adding or removing
+functionality therefore means adding or removing a process, not
+recompiling and rebooting the kernel---the structural advantage a
+microkernel holds over a monolithic system that would require rebuilding
+the kernel to add a driver \citep{qnx_neutrino_overview}.
+
+\paragraph{Performance versus Security}
+
+The trade-off is the textbook microkernel trade-off. The performance
+cost is real: routing services through message passing rather than
+direct calls adds context-switch overhead \citep{qnx_memman}. The
+security and reliability gain is full memory protection for every
+component, fault containment, and the ability to restart failed
+components---``virtually any component can fail and be automatically
+restarted without affecting other components or the kernel''
+\citep{qnx_neutrino_overview}. BlackBerry OS clearly prioritises
+isolation, fault tolerance, and security over raw throughput, because
+its QNX heritage is in systems where a crash is unacceptable
+\citep{qnx_ham, qnx_neutrino_overview}. A monolithic OS makes the
+opposite bet: faster in-kernel calls, but a faulty driver shares the
+kernel's address space and can take the whole system down.
+
+\paragraph{Fault Isolation and Stability}
+
+Because every driver and service runs as an isolated user-space process,
+a fault is contained to that process rather than the kernel: the MMU
+traps the bad access, the microkernel terminates the offending thread,
+and---critically---the failed component can be restarted dynamically
+without rebooting, since there is ``very little code running in kernel
+mode that could cause the microkernel itself to fail'' \citep{qnx_ham}.
+QNX builds on this with an optional High Availability Framework whose
+High Availability Manager (HAM)---a ``smart watchdog'' process---can
+monitor services, perform multistage recovery of dependent components,
+and generate a dump file for postmortem analysis \citep{qnx_ham}; that
+framework is the basis of the ``five nines'' (99.999\,\%) availability
+target cited for QNX-based HA systems \citep{qnx_ham}. Whether a given
+BlackBerry~10 handset enabled the HA Framework is not publicly
+documented, but the underlying restartability is an architectural
+property of the OS regardless. In the presence of failures, this
+microkernel design is considerably more robust than a monolithic kernel,
+where a faulting driver shares the kernel's address space.
+
+\paragraph{Overview --- Kernel}
+
+Strengths include fault isolation, runtime modularity, security through
+memory protection, real-time determinism, and a very small trusted code
+base \citep{bb_microkernel_dev, qnx_ham, qnx_neutrino_overview}.
+Weaknesses are that message passing adds overhead versus in-kernel calls
+and that the design is more complex to architect \citep{qnx_memman}.
+For a high-reliability or real-time system (servers, critical or
+embedded control), the QNX microkernel design performs better because a
+single component failure is recoverable rather than fatal
+\citep{qnx_ham, qnx_neutrino_overview}. For a raw-performance-critical
+workload, a monolithic competitor may hold a throughput edge by avoiding
+message-passing overhead.
